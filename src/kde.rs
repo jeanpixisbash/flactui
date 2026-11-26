@@ -66,12 +66,13 @@ async fn connect_on_bus(addr: Option<&str>) -> anyhow::Result<Phone> {
         }
         None => zbus::Connection::session().await?,
     };
-    // org.kde.kdeconnect on /modules/kdeconnect: deviceNames(onlyReachable, onlyPaired) -> a{ss}
+    // org.kde.kdeconnect.daemon on /modules/kdeconnect:
+    // deviceNames(onlyReachable, onlyPaired) -> a{ss}
     let names: std::collections::HashMap<String, String> = conn
         .call_method(
             Some(DEST),
             "/modules/kdeconnect",
-            Some("org.kde.kdeconnect"),
+            Some("org.kde.kdeconnect.daemon"),
             "deviceNames",
             &(true, true),
         )
