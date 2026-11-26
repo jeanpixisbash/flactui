@@ -103,13 +103,21 @@ impl Player {
         let req = serde_json::json!({ "command": command, "request_id": id });
         let mut line = serde_json::to_string(&req)?;
         line.push('\n');
-        self.writer.write_all(line.as_bytes()).await?;
-        self.writer.flush().await?;
+        let send = async {
+            self.writer.write_all(line.as_bytes()).await?;
+            self.writer.flush().await
+        };
+        if send.await.is_err() {
+            anyhow::bail!("mpv IPC socket closed");
+        }
 
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = self.reader.read_line(&mut buf).await?;
+            let n = match self.reader.read_line(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => anyhow::bail!("mpv IPC socket closed"),
+            };
             if n == 0 {
                 anyhow::bail!("mpv IPC socket closed");
             }

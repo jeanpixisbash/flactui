@@ -133,7 +133,14 @@ impl App {
                 self.queue = st.playlist.clone();
                 self.status = Some(st);
             }
-            Err(e) => self.message = Some(format!("player error: {e}")),
+            Err(e) => {
+                let msg = format!("{e}");
+                self.message = Some(if msg.contains("socket closed") {
+                    "player lost — press q to exit".into()
+                } else {
+                    format!("player error: {e}")
+                });
+            }
         }
     }
 
