@@ -107,9 +107,14 @@ fn draw_playbar(f: &mut Frame, app: &App, area: Rect) {
     .split(area);
 
     let state_marker = if paused { "⏸ " } else { "▶ " };
+    let flags = format!(
+        "{}{}",
+        if app.shuffle { "  [S]huffle" } else { "" },
+        if app.repeat { "  [R]epeat" } else { "" },
+    );
     f.render_widget(
         Paragraph::new(Line::from(format!(
-            "{state_marker}{title}   {}:{:02}/{}:{:02}",
+            "{state_marker}{title}   {}:{:02}/{}:{:02}{flags}",
             (pos as u64) / 60,
             (pos as u64) % 60,
             (dur as u64) / 60,
@@ -129,11 +134,11 @@ fn draw_playbar(f: &mut Frame, app: &App, area: Rect) {
     // hints; volume hidden on very narrow terminals
     let hints = if area.width >= 60 {
         format!(
-            " j/k move · enter play · space queue · / search · tab view  vol:{}%  n/p track  q quit",
+            " j/k move · enter play · space queue/pause · / search · tab · s shuffle · r repeat · ⇦⇨ seek  vol:{}%  q quit",
             app.volume
         )
     } else {
-        " j/k · enter · space · / · tab · q".to_string()
+        " j/k · enter · space · / · tab · s · r · q".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(hints)).style(Style::default().fg(Color::DarkGray)),
@@ -173,6 +178,9 @@ mod tests {
             path: Some("/m/Es Epico.flac".into()),
             playlist_pos: Some(0),
             playlist: vec!["Es Epico.flac".into()],
+            volume: Some(100),
+            shuffle: false,
+            loop_playlist: "no".into(),
         });
         app
     }

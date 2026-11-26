@@ -114,9 +114,21 @@ async fn connect_on_bus(addr: Option<&str>) -> anyhow::Result<Phone> {
     })
 }
 
-/// Unmount the phone's SFTP share.
+/// Unmount the phone's SFTP share. Uses the same bus fallback as connect(),
+/// because the farewell runs after the TUI in whatever bus env the user has.
 pub async fn unmount(device_id: &str) -> anyhow::Result<()> {
-    let conn = zbus::Connection::session().await?;
+    use std::str::FromStr;
+    let conn = match zbus::Connection::session().await {
+        Ok(c) => c,
+        Err(_) => match systemd_bus_address() {
+            Some(a) => {
+                zbus::connection::Builder::address(zbus::address::Address::from_str(&a)?)
+                    .build()
+                    .await?
+            }
+            None => anyhow::bail!("no D-Bus session available"),
+        },
+    };
     let path = format!("/modules/kdeconnect/devices/{device_id}/sftp");
     let sftp = zbus::Proxy::new(&conn, DEST, path, SFTP_IFACE).await?;
     sftp.call::<_, _, ()>("unmount", &()).await?;

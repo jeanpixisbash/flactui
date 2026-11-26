@@ -61,16 +61,18 @@ flactui --keep-mounted   # skip the unmount prompt on exit
 |---|---|
 | `j` / `k` (or arrows) | move cursor |
 | `Enter` | play selection |
-| `Space` | enqueue selection |
+| `Space` | enqueue selection (in the queue view: play/pause) |
 | `a` | enqueue everything currently filtered |
 | `/` | fuzzy search (type, `Enter`/`Esc` to end) |
 | `Tab` | switch library ↔ queue view |
-| `n` / `p` | next / previous track |
-| `+` / `-` | volume |
+| `n` / `p` | next / previous track (both views) |
+| `←` / `→` | seek −10 s / +10 s |
+| `s` / `r` | toggle shuffle / repeat |
+| `+` / `-` | volume (both views) |
 | `q` | quit (offers to unmount the phone) |
 
-In the queue view: `d` removes a track, `J`/`K` move it, `Enter` jumps to it,
-`D` clears the queue.
+In the queue view: `d` removes a track, `J`/`K` move it down/up, `Enter` jumps
+to it, `D` clears the queue.
 
 ## How it works
 

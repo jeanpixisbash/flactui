@@ -14,22 +14,20 @@ pub fn cache_path() -> PathBuf {
 }
 
 /// Walk `root` recursively and return audio file paths relative to `root`,
-/// sorted case-insensitively.
-pub fn build(root: &Path) -> Vec<String> {
+/// sorted case-insensitively. Any unreadable directory is an ERROR: a partial
+/// listing must never be cached (it would persist until a manual rm).
+pub fn build(root: &Path) -> io::Result<Vec<String>> {
     let mut out = Vec::new();
-    walk(root, root, &mut out);
+    walk(root, root, &mut out)?;
     out.sort_by_key(|a| a.to_lowercase());
-    out
+    Ok(out)
 }
 
-fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
+fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
         if path.is_dir() {
-            walk(base, &path, out);
+            walk(base, &path, out)?;
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
                 if let Ok(rel) = path.strip_prefix(base) {
@@ -38,13 +36,18 @@ fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
             }
         }
     }
+    Ok(())
 }
 
-/// Load the listing (one relative path per line).
+/// Load the listing (one relative path per line). Lines that cannot be audio
+/// files (e.g. phantom halves of a filename containing \n) are dropped.
 pub fn load(path: &Path) -> io::Result<Vec<String>> {
     Ok(std::fs::read_to_string(path)?
         .lines()
-        .filter(|l| !l.is_empty())
+        .filter(|l| {
+            let ext = l.rsplit('.').next().unwrap_or("");
+            !l.is_empty() && EXTENSIONS.contains(&ext.to_lowercase().as_str())
+        })
         .map(String::from)
         .collect())
 }
@@ -78,7 +81,7 @@ mod tests {
         std::fs::write(d.join("sub/b.m4a"), "").unwrap();
         std::fs::write(d.join("notes.txt"), "").unwrap();
         std::fs::write(d.join(".hidden"), "").unwrap();
-        let got = build(&d);
+        let got = build(&d).unwrap();
         assert_eq!(got, vec!["a.flac", "sub/b.m4a"]);
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -88,7 +91,7 @@ mod tests {
         let d = tmpdir("sort");
         std::fs::write(d.join("Zebra.flac"), "").unwrap();
         std::fs::write(d.join("apple.flac"), "").unwrap();
-        let got = build(&d);
+        let got = build(&d).unwrap();
         // case-SENSITIVE byte order would put "Zebra" (0x5A) first;
         // case-insensitive puts "apple" first.
         assert_eq!(got, vec!["apple.flac", "Zebra.flac"]);
@@ -118,6 +121,34 @@ mod tests {
         let p = d.join("library.list");
         save(&p, &[]).unwrap();
         assert_eq!(load(&p).unwrap(), Vec::<String>::new());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn build_propagates_unreadable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir("unreadable");
+        let sub = d.join("locked");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(d.join("ok.flac"), "").unwrap();
+        std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let res = build(&d);
+        // restore so remove_dir_all works
+        std::fs::set_permissions(&sub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert!(res.is_err(), "partial listings must not be cached silently");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn load_drops_lines_without_audio_extension() {
+        // a filename containing \n splits into phantom lines; load must drop
+        // lines that cannot be audio files
+        let d = tmpdir("phantom");
+        let p = d.join("library.list");
+        std::fs::write(&p, "real.flac\nx\nbroken\nmusic.mp3\n").unwrap();
+        assert_eq!(load(&p).unwrap(), vec!["real.flac", "music.mp3"]);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

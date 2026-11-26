@@ -40,13 +40,16 @@ async fn main() -> anyhow::Result<()> {
     })?;
     let music = kde::music_dir(&phone);
 
-    // cached library listing (rebuild when missing or empty)
+    // cached library listing (rebuild when missing or empty); a FAILED build
+    // is never cached — a partial index would otherwise persist forever
     let cache_file = cache::cache_path();
     let tracks = match cache::load(&cache_file) {
         Ok(t) if !t.is_empty() => t,
         _ => {
             println!("Listing your phone library (a few seconds)...");
-            let t = cache::build(&music);
+            let t = cache::build(&music).map_err(|e| {
+                anyhow::anyhow!("could not read the phone library ({e}) — try again")
+            })?;
             cache::save(&cache_file, &t)?;
             t
         }
@@ -92,8 +95,12 @@ async fn main() -> anyhow::Result<()> {
             let mut answer = String::new();
             let _ = std::io::stdin().read_line(&mut answer);
             if !answer.trim().starts_with('n') {
-                let _ = kde::unmount(&phone.device_id).await;
-                println!("Phone unmounted. Bye!");
+                match kde::unmount(&phone.device_id).await {
+                    Ok(()) => println!("Phone unmounted. Bye!"),
+                    Err(_) => println!(
+                        "Could not unmount from here — leave it with: flacast --unmount"
+                    ),
+                }
             }
         }
     }

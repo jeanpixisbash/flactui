@@ -33,6 +33,8 @@ pub struct App {
     pub message: Option<String>,
     pub search: Option<String>,
     pub volume: i64,
+    pub shuffle: bool,
+    pub repeat: bool,
 }
 
 impl App {
@@ -54,6 +56,8 @@ impl App {
             message: None,
             search: None,
             volume: 100,
+            shuffle: false,
+            repeat: false,
         }
     }
 
@@ -131,11 +135,16 @@ impl App {
         match p.status().await {
             Ok(st) => {
                 self.queue = st.playlist.clone();
+                if let Some(v) = st.volume {
+                    self.volume = v;
+                }
+                self.shuffle = st.shuffle;
+                self.repeat = st.loop_playlist != "no";
                 self.status = Some(st);
             }
             Err(e) => {
                 let msg = format!("{e}");
-                self.message = Some(if msg.contains("socket closed") {
+                self.message = Some(if msg.contains("socket closed") || msg.contains("timeout") {
                     "player lost — press q to exit".into()
                 } else {
                     format!("player error: {e}")
@@ -182,6 +191,10 @@ impl App {
                 KeyCode::Tab => self.view = View::Queue,
                 KeyCode::Char('n') => { let _ = p.next().await; }
                 KeyCode::Char('p') => { let _ = p.previous().await; }
+                KeyCode::Left => { let _ = p.seek(-10.0).await; }
+                KeyCode::Right => { let _ = p.seek(10.0).await; }
+                KeyCode::Char('s') => { let _ = p.toggle_shuffle().await; }
+                KeyCode::Char('r') => { let _ = p.toggle_repeat().await; }
                 KeyCode::Char('+') | KeyCode::Char('=') => {
                     self.volume = (self.volume + 5).min(130);
                     let _ = p.set_volume(self.volume).await;
@@ -202,14 +215,17 @@ impl App {
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.queue_cursor = self.queue_cursor.saturating_sub(1);
                 }
+                KeyCode::Char(' ') => { let _ = p.toggle_pause().await; }
                 KeyCode::Char('d') => {
                     let _ = p.playlist_remove(self.queue_cursor).await;
                     self.queue_cursor = self.queue_cursor.saturating_sub(1);
                 }
                 KeyCode::Char('J') => {
+                    // mpv semantics: index2 is the TARGET entry, so moving one
+                    // position down requires to = from + 2 (verified on real mpv)
                     let c = self.queue_cursor;
                     if c + 1 < self.queue.len() {
-                        let _ = p.playlist_move(c, c + 1).await;
+                        let _ = p.playlist_move(c, c + 2).await;
                         self.queue_cursor += 1;
                     }
                 }
@@ -226,6 +242,18 @@ impl App {
                 KeyCode::Char('D') => {
                     let _ = p.playlist_clear().await;
                     self.queue_cursor = 0;
+                }
+                KeyCode::Char('n') => { let _ = p.next().await; }
+                KeyCode::Char('p') => { let _ = p.previous().await; }
+                KeyCode::Left => { let _ = p.seek(-10.0).await; }
+                KeyCode::Right => { let _ = p.seek(10.0).await; }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    self.volume = (self.volume + 5).min(130);
+                    let _ = p.set_volume(self.volume).await;
+                }
+                KeyCode::Char('-') => {
+                    self.volume = (self.volume - 5).max(0);
+                    let _ = p.set_volume(self.volume).await;
                 }
                 KeyCode::Tab | KeyCode::Esc => self.view = View::Library,
                 _ => {}
@@ -268,7 +296,7 @@ mod tests {
                 let id = req["request_id"].clone();
                 let cmd = req["command"].as_array().unwrap();
                 let name = cmd[0].as_str().unwrap().to_string();
-                log_srv.lock().await.push(name.clone());
+                log_srv.lock().await.push(req["command"].to_string());
                 let data = if name == "get_property" {
                     prop_data
                         .get(cmd[1].as_str().unwrap())
@@ -384,8 +412,102 @@ mod tests {
         app.view = View::Queue;
         app.queue_cursor = 1;
         app.on_key(key('d'), &mut player).await;
-        assert!(log.lock().await.contains(&"playlist-remove".to_string()));
+        assert!(log.lock().await.iter().any(|c| c.contains("playlist-remove")));
         assert_eq!(app.queue_cursor, 0); // clamped after remove
+    }
+
+    #[tokio::test]
+    async fn queue_move_down_uses_mpv_target_semantics() {
+        // mpv: playlist-move from to — "to" is the TARGET entry index, so
+        // moving one position down requires to = from + 2.
+        let (mut player, log) = fake_player(serde_json::json!({
+            "pause": false,
+            "playlist": [
+                {"filename": "/m/a.flac"},
+                {"filename": "/m/b.flac"},
+                {"filename": "/m/c.flac"}
+            ],
+            "playlist-pos": 0
+        }))
+        .await;
+        let mut app = app_with(&["a.flac"]);
+        app.refresh_status(&mut player).await;
+        app.view = View::Queue;
+        app.queue_cursor = 0;
+        app.on_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT), &mut player)
+            .await;
+        let log = log.lock().await;
+        let mv = log.iter().find(|c| c.contains("playlist-move")).unwrap();
+        assert!(mv.contains("2"), "expected playlist-move 0 2, got {mv}");
+        drop(log);
+        assert_eq!(app.queue_cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn queue_move_up_uses_direct_target() {
+        let (mut player, log) = fake_player(serde_json::json!({
+            "pause": false,
+            "playlist": [
+                {"filename": "/m/a.flac"},
+                {"filename": "/m/b.flac"}
+            ],
+            "playlist-pos": 1
+        }))
+        .await;
+        let mut app = app_with(&["a.flac"]);
+        app.refresh_status(&mut player).await;
+        app.view = View::Queue;
+        app.queue_cursor = 1;
+        app.on_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT), &mut player)
+            .await;
+        let log = log.lock().await;
+        let mv = log.iter().find(|c| c.contains("playlist-move")).unwrap();
+        assert!(mv.contains("0"), "expected playlist-move 1 0, got {mv}");
+        drop(log);
+        assert_eq!(app.queue_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn shuffle_repeat_and_seek_keys() {
+        let (mut player, log) = fake_player(serde_json::json!({
+            "pause": false, "shuffle": false, "loop-playlist": "no",
+            "playlist": [], "playlist-pos": 0, "volume": 55
+        }))
+        .await;
+        let mut app = app_with(&["a.flac"]);
+        app.refresh_status(&mut player).await;
+        // volume synced from mpv
+        assert_eq!(app.volume, 55);
+
+        app.on_key(key('s'), &mut player).await; // shuffle
+        app.on_key(key('r'), &mut player).await; // repeat
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut player).await;
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut player).await;
+        let log = log.lock().await;
+        assert!(log.iter().any(|c| c.contains("shuffle")), "no shuffle: {log:?}");
+        assert!(log.iter().any(|c| c.contains("loop-playlist")), "no repeat: {log:?}");
+        assert!(log.iter().any(|c| c.contains("seek")), "no seek: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn queue_view_space_pauses_and_n_p_volume_work_there_too() {
+        let (mut player, log) = fake_player(serde_json::json!({
+            "pause": false, "shuffle": false, "loop-playlist": "no",
+            "playlist": [{"filename": "/m/a.flac"}], "playlist-pos": 0, "volume": 100
+        }))
+        .await;
+        let mut app = app_with(&["a.flac"]);
+        app.refresh_status(&mut player).await;
+        app.view = View::Queue;
+        app.on_key(key(' '), &mut player).await; // pause in queue view
+        app.on_key(key('n'), &mut player).await;
+        app.on_key(key('p'), &mut player).await;
+        app.on_key(key('+'), &mut player).await;
+        let log = log.lock().await;
+        assert!(log.iter().any(|c| c.contains("cycle")), "no pause cycle: {log:?}");
+        assert!(log.iter().any(|c| c.contains("playlist-next")));
+        assert!(log.iter().any(|c| c.contains("playlist-prev")));
+        assert!(log.iter().any(|c| c.contains("volume")));
     }
 
     #[tokio::test]

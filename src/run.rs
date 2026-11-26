@@ -66,7 +66,13 @@ pub async fn run_app<B: Backend>(
     tick: Duration,
 ) -> anyhow::Result<()> {
     loop {
-        app.refresh_status(player).await;
+        // bound the poll: a stuck mpv must not freeze the loop (keys keep working)
+        if tokio::time::timeout(tick + Duration::from_secs(1), app.refresh_status(player))
+            .await
+            .is_err()
+        {
+            app.message = Some("player not responding — press q to exit".into());
+        }
         if !player.is_alive() {
             app.message = Some("player lost — press q to exit".into());
         }

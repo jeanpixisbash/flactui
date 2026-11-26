@@ -13,7 +13,13 @@ pub struct PlayerStatus {
     pub path: Option<String>,
     pub playlist_pos: Option<usize>,
     pub playlist: Vec<String>,
+    pub volume: Option<i64>,
+    pub shuffle: bool,
+    pub loop_playlist: String,
 }
+
+/// Per-command IPC deadline: a stuck mpv must never freeze the whole TUI.
+const IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LoadMode {
@@ -42,7 +48,12 @@ impl Player {
     /// Spawn mpv as a persistent idle process and connect to its IPC socket.
     pub async fn spawn() -> anyhow::Result<Player> {
         let dir = std::env::temp_dir();
-        let sock = dir.join(format!("flactui-{}.sock", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        // unpredictable name: don't let another local user pre-create it
+        let sock = dir.join(format!("flactui-{}-{}.sock", std::process::id(), nanos));
         let _ = std::fs::remove_file(&sock);
         let child = tokio::process::Command::new("mpv")
             .args([
@@ -52,6 +63,7 @@ impl Player {
                 "--keep-open=no",
                 format!("--input-ipc-server={}", sock.display()).as_str(),
             ])
+            .kill_on_drop(true) // never orphan mpv, even on a hard TUI death
             .spawn()?;
         // wait for the socket to appear
         for _ in 0..50 {
@@ -107,16 +119,17 @@ impl Player {
             self.writer.write_all(line.as_bytes()).await?;
             self.writer.flush().await
         };
-        if send.await.is_err() {
-            anyhow::bail!("mpv IPC socket closed");
+        if tokio::time::timeout(IPC_TIMEOUT, send).await.is_err() {
+            anyhow::bail!("mpv IPC socket timeout (write)");
         }
 
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = match self.reader.read_line(&mut buf).await {
-                Ok(n) => n,
-                Err(_) => anyhow::bail!("mpv IPC socket closed"),
+            let read_one = self.reader.read_line(&mut buf);
+            let n = match tokio::time::timeout(IPC_TIMEOUT, read_one).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) | Err(_) => anyhow::bail!("mpv IPC socket timeout or closed"),
             };
             if n == 0 {
                 anyhow::bail!("mpv IPC socket closed");
@@ -145,14 +158,19 @@ impl Player {
         let path = self.command(get("path")).await?;
         let playlist_pos = self.command(get("playlist-pos")).await?;
         let playlist_raw = self.command(get("playlist")).await?;
+        let volume = self.command(get("volume")).await?;
+        let shuffle = self.command(get("shuffle")).await?;
+        let loop_playlist = self.command(get("loop-playlist")).await?;
 
         let prop = |v: &Value| v.get("data").cloned().unwrap_or(Value::Null);
         let opt_f = |v: &Value| prop(v).as_f64();
+        // keep entries WITHOUT filename as placeholders so the queue view's
+        // ▶ marker (which compares against playlist_pos) stays aligned
         let playlist = prop(&playlist_raw)
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|e| {
+                    .map(|e| {
                         e.get("filename")
                             .and_then(Value::as_str)
                             .map(|f| {
@@ -161,6 +179,7 @@ impl Player {
                                     .map(|s| s.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| f.to_string())
                             })
+                            .unwrap_or_else(|| "(unknown)".to_string())
                     })
                     .collect()
             })
@@ -173,11 +192,24 @@ impl Player {
             path: prop(&path).as_str().map(String::from),
             playlist_pos: prop(&playlist_pos).as_u64().map(|v| v as usize),
             playlist,
+            volume: prop(&volume).as_i64(),
+            shuffle: prop(&shuffle).as_bool().unwrap_or(false),
+            loop_playlist: prop(&loop_playlist).as_str().unwrap_or("no").to_string(),
         })
     }
 
     pub async fn toggle_pause(&mut self) -> anyhow::Result<Value> {
         self.command(serde_json::json!({ "command": ["cycle", "pause"] }))
+            .await
+    }
+
+    pub async fn toggle_shuffle(&mut self) -> anyhow::Result<Value> {
+        self.command(serde_json::json!({ "command": ["cycle", "shuffle"] }))
+            .await
+    }
+
+    pub async fn toggle_repeat(&mut self) -> anyhow::Result<Value> {
+        self.command(serde_json::json!({ "command": ["cycle", "loop-playlist"] }))
             .await
     }
 
@@ -334,6 +366,9 @@ mod tests {
                     "duration" => serde_json::json!(300.0),
                     "path" => serde_json::json!("/m/Es Epico.flac"),
                     "playlist-pos" => serde_json::json!(2),
+                    "volume" => serde_json::json!(73),
+                    "shuffle" => Value::Bool(true),
+                    "loop-playlist" => serde_json::json!("inf"),
                     "playlist" => serde_json::json!([
                         {"filename": "/m/Vida.flac"},
                         {"filename": "/m/Perdon.flac"},
@@ -353,6 +388,34 @@ mod tests {
         assert_eq!(st.path.as_deref(), Some("/m/Es Epico.flac"));
         assert_eq!(st.playlist_pos, Some(2));
         assert_eq!(st.playlist, vec!["Vida.flac", "Perdon.flac", "Es Epico.flac"]);
+        assert_eq!(st.volume, Some(73));
+        assert!(st.shuffle);
+        assert_eq!(st.loop_playlist, "inf");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn unresponsive_server_times_out_instead_of_hanging() {
+        // server accepts the connection but NEVER replies
+        let sock = unique_dir("dead").join("fake.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (_s, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let mut p = Player::connect(&sock).await.unwrap();
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            p.loadfile("/x.flac", LoadMode::Replace),
+        )
+        .await;
+        // must fail from OUR timeout (well before the 10 s outer guard)
+        assert!(start.elapsed() < std::time::Duration::from_secs(9));
+        match res {
+            Err(_) => panic!("outer timeout fired first — no IPC timeout implemented"),
+            Ok(Err(e)) => assert!(format!("{e}").contains("timeout")),
+            Ok(Ok(_)) => panic!("unexpected success"),
+        }
     }
 }
