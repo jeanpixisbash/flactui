@@ -30,6 +30,48 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     draw_playbar(f, app, chunks[1]);
+
+    if app.lyrics.is_some() {
+        draw_lyrics(f, app);
+    }
+}
+
+fn draw_lyrics(f: &mut Frame, app: &App) {
+    let area = centered_rect(70, 70, f.area());
+    f.render_widget(ratatui::widgets::Clear, area); // wipe what's underneath
+
+    let text = app.lyrics.as_deref().unwrap_or("");
+    let n_lines = text.lines().count().max(1);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let max_off = n_lines.saturating_sub(inner_h);
+    let off = app.lyrics_scroll.min(max_off) as u16;
+
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" lyrics ({n_lines} lines · Esc closes) "))
+                .border_style(Style::default().fg(ACCENT_2)),
+        )
+        .style(Style::default().fg(Color::White))
+        .scroll((off, 0));
+    f.render_widget(para, area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let v = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(area);
+    let h = Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(v[1]);
+    h[1]
 }
 
 fn draw_library(f: &mut Frame, app: &App, area: Rect) {
@@ -134,7 +176,7 @@ fn draw_playbar(f: &mut Frame, app: &App, area: Rect) {
     // hints; volume hidden on very narrow terminals
     let hints = if area.width >= 60 {
         format!(
-            " j/k move · enter play · space pause · e queue · / search · tab · s shuffle · r repeat · ⇦⇨ seek  vol:{}%  q quit",
+            " j/k move · enter play · space pause · e queue · / search · tab · l lyrics · s shuffle · r repeat · ⇦⇨ seek  vol:{}%  q quit",
             app.volume
         )
     } else {
@@ -229,6 +271,27 @@ mod tests {
         let app = app_playing();
         let text = render_at(50, 12, &app);
         assert!(!text.contains("vol:"));
+    }
+
+    #[test]
+    fn lyrics_popup_renders_over_library_and_scrolls() {
+        let mut app = app_playing();
+        // distinct first/last markers: "line 01" would substring-match "line 10"
+        // 22 lines vs ~19 visible → max scroll 3, so scroll=2 shows the tail
+        let mut lines = vec!["primera".to_string()];
+        lines.extend((2..=21).map(|i| format!("relleno {i}")));
+        lines.push("última".to_string());
+        app.lyrics = Some(lines.join("\n"));
+        let text = render_at(120, 30, &app);
+        assert!(text.contains("primera"), "popup should render: {text}");
+        assert!(text.contains("lyrics"), "title bar");
+
+        // con scroll al máximo (22 líneas, ~19 visibles → máx 3),
+        // la primera línea sale del área y se ve el final
+        app.lyrics_scroll = 3;
+        let scrolled = render_at(120, 30, &app);
+        assert!(!scrolled.contains("primera"), "scrolled past first line");
+        assert!(scrolled.contains("última"));
     }
 
     #[test]

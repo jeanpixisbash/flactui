@@ -69,6 +69,7 @@ flactui --keep-mounted   # skip the unmount prompt on exit
 | `n` / `p` | next / previous track (both views) |
 | `←` / `→` | seek −10 s / +10 s |
 | `s` / `r` | toggle shuffle / repeat |
+| `l` | lyrics popup (embedded tags; `j`/`k` scroll, `Esc` closes) |
 | `+` / `-` | volume (both views) |
 | `q` | quit (offers to unmount the phone) |
 

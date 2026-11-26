@@ -198,6 +198,26 @@ impl Player {
         })
     }
 
+    /// The playing file's tags (FLAC Vorbis comments etc.) as key-value pairs.
+    pub async fn metadata(&mut self) -> anyhow::Result<Vec<(String, String)>> {
+        let resp = self
+            .command(serde_json::json!({ "command": ["get_property", "metadata"] }))
+            .await?;
+        let prop = resp.get("data").cloned().unwrap_or(Value::Null);
+        let mut out = Vec::new();
+        if let Some(map) = prop.as_object() {
+            for (k, v) in map {
+                let val = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Null => continue,
+                    other => other.to_string(),
+                };
+                out.push((k.clone(), val));
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn toggle_pause(&mut self) -> anyhow::Result<Value> {
         self.command(serde_json::json!({ "command": ["cycle", "pause"] }))
             .await
@@ -417,5 +437,42 @@ mod tests {
             Ok(Err(e)) => assert!(format!("{e}").contains("timeout")),
             Ok(Ok(_)) => panic!("unexpected success"),
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_parses_tag_map() {
+        // server that replies with a metadata map for the metadata property
+        let sock = unique_dir("md").join("fake.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let id = req["request_id"].clone();
+                let data = serde_json::json!({
+                    "TITLE": "Es Épico",
+                    "LYRICS": "primera línea\nsegunda línea"
+                });
+                let resp = serde_json::json!({ "error": "success", "request_id": id, "data": data });
+                write.write_all(format!("{resp}\n").as_bytes()).await.unwrap();
+            }
+        });
+        let mut p = Player::connect(&sock).await.unwrap();
+        let md = p.metadata().await.unwrap();
+        assert!(md.contains(&("LYRICS".to_string(), "primera línea\nsegunda línea".to_string())));
+        assert!(md.contains(&("TITLE".to_string(), "Es Épico".to_string())));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metadata_none_when_nothing_playing() {
+        // get_property on a property that is unavailable → data null → empty map
+        let (sock, server) = fake_server(Value::Null).await;
+        let mut p = Player::connect(&sock).await.unwrap();
+        let md = p.metadata().await.unwrap();
+        assert!(md.is_empty());
+        server.abort();
     }
 }

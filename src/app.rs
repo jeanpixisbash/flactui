@@ -35,6 +35,9 @@ pub struct App {
     pub volume: i64,
     pub shuffle: bool,
     pub repeat: bool,
+    /// lyrics popup: Some(text) = open
+    pub lyrics: Option<String>,
+    pub lyrics_scroll: usize,
 }
 
 impl App {
@@ -58,6 +61,8 @@ impl App {
             volume: 100,
             shuffle: false,
             repeat: false,
+            lyrics: None,
+            lyrics_scroll: 0,
         }
     }
 
@@ -153,9 +158,50 @@ impl App {
         }
     }
 
+    /// Toggle the lyrics popup: reads the playing file's embedded lyrics tag
+    /// through mpv's metadata property (zero network).
+    pub async fn toggle_lyrics(&mut self, p: &mut Player) {
+        if self.lyrics.is_some() {
+            self.lyrics = None;
+            self.lyrics_scroll = 0;
+            return;
+        }
+        match p.metadata().await {
+            Ok(pairs) => {
+                let found = pairs
+                    .iter()
+                    .find(|(k, _)| k.to_uppercase().contains("LYRICS"))
+                    .map(|(_, v)| v.clone());
+                self.lyrics = Some(found.unwrap_or_else(|| {
+                    if self.status.as_ref().and_then(|s| s.path.as_ref()).is_some() {
+                        "no lyrics found in this file's tags".into()
+                    } else {
+                        "nothing playing".into()
+                    }
+                }));
+                self.lyrics_scroll = 0;
+            }
+            Err(e) => self.message = Some(format!("player error: {e}")),
+        }
+    }
+
     pub async fn on_key(&mut self, key: KeyEvent, p: &mut Player) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
+        }
+        // lyrics popup consumes keys while open
+        if self.lyrics.is_some() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.lyrics_scroll += 1,
+                KeyCode::Char('k') | KeyCode::Up => self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1),
+                KeyCode::Char('g') => self.lyrics_scroll = 0,
+                KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('q') => {
+                    self.lyrics = None;
+                    self.lyrics_scroll = 0;
+                }
+                _ => {}
+            }
+            return Action::None;
         }
         // search input mode
         if let Some(q) = &mut self.search {
@@ -198,6 +244,7 @@ impl App {
                 KeyCode::Right => { let _ = p.seek(10.0).await; }
                 KeyCode::Char('s') => { let _ = p.toggle_shuffle().await; }
                 KeyCode::Char('r') => { let _ = p.toggle_repeat().await; }
+                KeyCode::Char('l') => self.toggle_lyrics(p).await,
                 KeyCode::Char('+') | KeyCode::Char('=') => {
                     self.volume = (self.volume + 5).min(130);
                     let _ = p.set_volume(self.volume).await;
@@ -530,6 +577,54 @@ mod tests {
             log.iter().any(|c| c.contains("append-play")),
             "no enqueue: {log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn lyrics_popup_opens_closes_and_scrolls() {
+        let (mut player, _log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100,
+            "metadata": {"TITLE": "Es Épico", "LYRICS": "verso 1\nverso 2\nverso 3"}
+        }))
+        .await;
+        let mut app = app_with(&["a.flac"]);
+
+        // 'l' abre el pop-up con la letra del tag LYRICS
+        app.on_key(key('l'), &mut player).await;
+        assert_eq!(app.lyrics.as_deref(), Some("verso 1\nverso 2\nverso 3"));
+
+        // j/k hacen scroll
+        app.on_key(key('j'), &mut player).await;
+        app.on_key(key('j'), &mut player).await;
+        assert_eq!(app.lyrics_scroll, 2);
+        app.on_key(key('k'), &mut player).await;
+        assert_eq!(app.lyrics_scroll, 1);
+
+        // Esc cierra y resetea el scroll
+        app.on_key(KeyCode::Esc.into(), &mut player).await;
+        assert!(app.lyrics.is_none());
+        assert_eq!(app.lyrics_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn lyrics_without_tag_shows_hint() {
+        let (mut player, _log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100,
+            "path": "/m/sin letra.flac",
+            "metadata": {"TITLE": "sin letra"}
+        }))
+        .await;
+        let mut app = app_with(&["sin letra.flac"]);
+        app.refresh_status(&mut player).await;
+        app.on_key(key('l'), &mut player).await;
+        assert_eq!(app.lyrics.as_deref(), Some("no lyrics found in this file's tags"));
+    }
+
+    #[tokio::test]
+    async fn lyrics_nothing_playing_shows_hint() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["a.flac"]);
+        app.on_key(key('l'), &mut player).await;
+        assert_eq!(app.lyrics.as_deref(), Some("nothing playing"));
     }
 
     #[tokio::test]

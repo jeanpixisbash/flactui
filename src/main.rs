@@ -33,11 +33,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Connecting to your phone (KDE Connect)...");
-    let phone = kde::connect().await.map_err(|e| {
-        anyhow::anyhow!(
-            "flactui: {e}\n  - open the KDE Connect app on your phone (Android kills it in the background)\n  - check phone and computer are on the same network"
-        )
-    })?;
+    // the phone often flaps (Android doze) — a couple of quick retries with a
+    // refresh in between make starting up feel reliable instead of a coin flip
+    let phone = {
+        let mut phone = None;
+        for attempt in 1..=3 {
+            match kde::connect().await {
+                Ok(p) => {
+                    phone = Some(p);
+                    break;
+                }
+                Err(e) if attempt < 3 => {
+                    eprintln!("  attempt {attempt}/3 failed ({e}); retrying...");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => anyhow::bail!(
+                    "flactui: {e}\n  - open the KDE Connect app on your phone (Android kills it in the background)\n  - check phone and computer are on the same network"
+                ),
+            }
+        }
+        phone.expect("loop ran at least once")
+    };
     let music = kde::music_dir(&phone);
 
     // cached library listing (rebuild when missing or empty); a FAILED build
