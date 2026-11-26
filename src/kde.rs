@@ -93,18 +93,21 @@ async fn connect_on_bus(addr: Option<&str>) -> anyhow::Result<Phone> {
     let path = format!("/modules/kdeconnect/devices/{device_id}/sftp");
     let sftp = zbus::Proxy::new(&conn, DEST, path, SFTP_IFACE).await?;
 
-    if !sftp.get_property::<bool>("isMounted").await.unwrap_or(false) {
-        sftp.call::<_, _, ()>("mountAndWait", &()).await?;
+    // NOTE: isMounted/mountPoint are METHODS on this interface (not properties),
+    // and mountAndWait returns a bool — verified against the live daemon.
+    let mounted: bool = sftp.call("isMounted", &()).await.unwrap_or(false);
+    if !mounted {
+        let _started: bool = sftp.call("mountAndWait", &()).await?;
         // the share can take a moment to become browsable (flacast lesson)
         for _ in 0..10 {
-            if sftp.get_property::<bool>("isMounted").await.unwrap_or(false) {
+            if sftp.call::<_, _, bool>("isMounted", &()).await.unwrap_or(false) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
-    let mount_point: String = sftp.get_property("mountPoint").await?;
+    let mount_point: String = sftp.call("mountPoint", &()).await?;
     Ok(Phone {
         device_id,
         mount_point: mount_point.into(),
