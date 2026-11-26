@@ -185,7 +185,10 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
                 KeyCode::Enter => self.play_selected(p).await,
-                KeyCode::Char(' ') => self.enqueue_selected(p).await,
+                // Space = play/pause everywhere (spotify-tui style);
+                // enqueue lives on 'e'
+                KeyCode::Char(' ') => { let _ = p.toggle_pause().await; }
+                KeyCode::Char('e') => self.enqueue_selected(p).await,
                 KeyCode::Char('a') => self.enqueue_all_filtered(p).await,
                 KeyCode::Char('/') => self.search = Some(String::new()),
                 KeyCode::Tab => self.view = View::Queue,
@@ -508,6 +511,25 @@ mod tests {
         assert!(log.iter().any(|c| c.contains("playlist-next")));
         assert!(log.iter().any(|c| c.contains("playlist-prev")));
         assert!(log.iter().any(|c| c.contains("volume")));
+    }
+
+    #[tokio::test]
+    async fn library_space_pauses_and_e_enqueues() {
+        let (mut player, log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100
+        }))
+        .await;
+        let mut app = app_with(&["a.flac"]);
+        // Space = play/pause GLOBAL (como spotify-tui)
+        app.on_key(key(' '), &mut player).await;
+        assert!(log.lock().await.iter().any(|c| c.contains("cycle")));
+        // 'e' = encolar la selección
+        app.on_key(key('e'), &mut player).await;
+        let log = log.lock().await;
+        assert!(
+            log.iter().any(|c| c.contains("append-play")),
+            "no enqueue: {log:?}"
+        );
     }
 
     #[tokio::test]

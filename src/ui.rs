@@ -134,11 +134,11 @@ fn draw_playbar(f: &mut Frame, app: &App, area: Rect) {
     // hints; volume hidden on very narrow terminals
     let hints = if area.width >= 60 {
         format!(
-            " j/k move · enter play · space queue/pause · / search · tab · s shuffle · r repeat · ⇦⇨ seek  vol:{}%  q quit",
+            " j/k move · enter play · space pause · e queue · / search · tab · s shuffle · r repeat · ⇦⇨ seek  vol:{}%  q quit",
             app.volume
         )
     } else {
-        " j/k · enter · space · / · tab · s · r · q".to_string()
+        " j/k · enter · space · e · / · tab · s · r · q".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(hints)).style(Style::default().fg(Color::DarkGray)),

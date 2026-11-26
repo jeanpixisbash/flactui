@@ -88,14 +88,14 @@ async fn enqueue_then_status_shows_queue_then_quit() {
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
     run_app(
         &mut terminal,
-        EventPump::from_events(vec![key(' ')]),
+        EventPump::from_events(vec![key('e')]),
         &mut player,
         &mut app,
         Duration::from_millis(1),
     )
     .await
     .unwrap();
-    // the spacebar enqueued; the next poll picked the queue up
+    // the 'e' key enqueued; the next poll picked the queue up
     assert_eq!(app.queue, vec!["Perdon.flac"]);
     assert!(app.message.is_none());
 }
@@ -171,7 +171,7 @@ async fn enqueue_missing_file_shows_message() {
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
     run_app(
         &mut terminal,
-        EventPump::from_events(vec![key(' ')]),
+        EventPump::from_events(vec![key('e')]),
         &mut player,
         &mut app,
         Duration::from_millis(1),

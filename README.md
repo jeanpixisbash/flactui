@@ -61,7 +61,8 @@ flactui --keep-mounted   # skip the unmount prompt on exit
 |---|---|
 | `j` / `k` (or arrows) | move cursor |
 | `Enter` | play selection |
-| `Space` | enqueue selection (in the queue view: play/pause) |
+| `Space` | **play/pause** (in both views, spotify-tui style) |
+| `e` | enqueue selection |
 | `a` | enqueue everything currently filtered |
 | `/` | fuzzy search (type, `Enter`/`Esc` to end) |
 | `Tab` | switch library ↔ queue view |
