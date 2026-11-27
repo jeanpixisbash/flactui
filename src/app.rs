@@ -380,17 +380,58 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
-        // cover popup consumes keys while open
+        // cover popup consumes keys while open — but playback controls still
+        // reach the player (the popup is fullscreen, music control must live)
         if self.cover.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => self.cover = None,
+                KeyCode::Char('n') => {
+                    let _ = p.next().await;
+                }
+                KeyCode::Char('p') => {
+                    let _ = p.previous().await;
+                }
+                KeyCode::Char(' ') => {
+                    let _ = p.toggle_pause().await;
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    self.volume = (self.volume + 5).min(130);
+                    let _ = p.set_volume(self.volume).await;
+                }
+                KeyCode::Char('-') => {
+                    self.volume = (self.volume - 5).max(0);
+                    let _ = p.set_volume(self.volume).await;
+                }
                 _ => {}
             }
             return Action::None;
         }
-        // lyrics popup consumes keys while open
+        // lyrics popup consumes keys while open — but playback controls still
+        // reach the player (fullscreen popup, music control must live)
         if self.lyrics.is_some() {
             match (&self.lyrics, key.code) {
+                (_, KeyCode::Char('n')) => {
+                    let _ = p.next().await;
+                    return Action::None;
+                }
+                (_, KeyCode::Char('p')) => {
+                    let _ = p.previous().await;
+                    return Action::None;
+                }
+                (_, KeyCode::Char(' ')) => {
+                    let _ = p.toggle_pause().await;
+                    return Action::None;
+                }
+                (_, KeyCode::Char('+') | KeyCode::Char('=')) => {
+                    self.volume = (self.volume + 5).min(130);
+                    let _ = p.set_volume(self.volume).await;
+                    return Action::None;
+                }
+                (_, KeyCode::Char('-')) => {
+                    self.volume = (self.volume - 5).max(0);
+                    let _ = p.set_volume(self.volume).await;
+                    return Action::None;
+                }
                 (Some(Lyrics::Plain(_)), KeyCode::Char('j') | KeyCode::Down) => self.lyrics_scroll += 1,
                 (Some(Lyrics::Plain(_)), KeyCode::Char('k') | KeyCode::Up) => {
                     self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1)
@@ -1155,6 +1196,48 @@ mod tests {
         app.lyrics_offset = 3;
         app.on_key(key('g'), &mut player).await;
         assert_eq!(app.lyrics_offset, -10);
+    }
+
+    #[tokio::test]
+    async fn cover_popup_playback_keys_pass_through() {
+        let (mut player, log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["a.flac"]);
+        app.toggle_cover(&mut player).await;
+        for (c, want) in [
+            ('n', "playlist-next"),
+            ('p', "playlist-prev"),
+            ('+', "volume"),
+            ('-', "volume"),
+            (' ', "cycle"),
+        ] {
+            app.on_key(key(c), &mut player).await;
+            assert!(
+                log.lock().await.iter().any(|cmd| cmd.contains(want)),
+                "key {c:?} must reach the player while cover is open"
+            );
+            assert!(app.cover.is_some(), "popup stays open");
+        }
+    }
+
+    #[tokio::test]
+    async fn lyrics_popup_playback_keys_pass_through() {
+        let (mut player, log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["a.flac"]);
+        app.lyrics = Some(super::Lyrics::Plain("texto".into()));
+        for (c, want) in [
+            ('n', "playlist-next"),
+            ('p', "playlist-prev"),
+            ('+', "volume"),
+            ('-', "volume"),
+            (' ', "cycle"),
+        ] {
+            app.on_key(key(c), &mut player).await;
+            assert!(
+                log.lock().await.iter().any(|cmd| cmd.contains(want)),
+                "key {c:?} must reach the player while lyrics are open"
+            );
+            assert!(app.lyrics.is_some(), "popup stays open");
+        }
     }
 
     #[tokio::test]

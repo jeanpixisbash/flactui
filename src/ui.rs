@@ -129,7 +129,7 @@ fn draw_timed_lyrics(f: &mut Frame, app: &App, area: Rect, lines: &crate::lyrics
     let inner = {
         let b = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" lyrics · synced ({}) · j/k browse · g top · Esc closes ", lines.lines.len()))
+            .title(format!(" lyrics · synced ({}) · j/k browse · g top · n/p skip · space pause · +/- vol · Esc closes ", lines.lines.len()))
             .border_style(Style::default().fg(ACCENT_2));
         let i = b.inner(area);
         f.render_widget(b, area);
