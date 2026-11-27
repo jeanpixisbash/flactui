@@ -57,28 +57,32 @@ fn systemd_bus_address() -> Option<String> {
 }
 
 async fn connect_on_bus(addr: Option<&str>) -> anyhow::Result<Phone> {
+    use std::str::FromStr;
+    // Per-call deadline: with a half-connected phone the daemon can stall a
+    // reachability query until the D-Bus default timeout (~25 s), turning every
+    // attempt into a freeze. 5 s keeps the retry loop snappy.
+    const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let conn = match addr {
-        Some(a) => {
-            use std::str::FromStr;
-            zbus::connection::Builder::address(zbus::address::Address::from_str(a)?)
-                .build()
-                .await?
-        }
-        None => zbus::Connection::session().await?,
+        Some(a) => zbus::connection::Builder::address(zbus::address::Address::from_str(a)?)
+            .method_timeout(CALL_TIMEOUT)
+            .build()
+            .await?,
+        None => zbus::connection::Builder::session()
+            .method_timeout(CALL_TIMEOUT)
+            .build()
+            .await?,
     };
+
     // org.kde.kdeconnect.daemon on /modules/kdeconnect:
     // deviceNames(onlyReachable, onlyPaired) -> a{ss}
-    let names: std::collections::HashMap<String, String> = conn
-        .call_method(
-            Some(DEST),
-            "/modules/kdeconnect",
-            Some("org.kde.kdeconnect.daemon"),
-            "deviceNames",
-            &(true, true),
-        )
-        .await?
-        .body()
-        .deserialize()?;
+    let daemon = zbus::Proxy::new(&conn, DEST, "/modules/kdeconnect", "org.kde.kdeconnect.daemon")
+        .await?;
+    // nudge discovery like `kdeconnect-cli --refresh` (phone often in doze)
+    let _: () = daemon.call("forceOnNetworkChange", &()).await.unwrap_or(());
+    let names_res: std::collections::HashMap<String, String> = daemon
+        .call::<_, _, std::collections::HashMap<String, String>>("deviceNames", &(true, true))
+        .await?;
+    let names = names_res;
 
     let device_id = pick_device(
         &names
