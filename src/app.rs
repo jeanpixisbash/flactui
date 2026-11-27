@@ -188,6 +188,44 @@ impl App {
         }
     }
 
+    /// Strip LRC markup from an embedded lyrics tag: line timestamps
+    /// `[mm:ss.xx]`, word timestamps `<mm:ss.xx>` (often duplicated), metadata
+    /// headers (`[ti:…]`) and voice labels (`v1:`, `bg:`). Plain text — and
+    /// lyrics with a stray "<3" — will lose the "<3" to this; acceptable.
+    fn clean_lyrics(raw: &str) -> String {
+        const VOICE_LABELS: [&str; 6] = ["v1", "v2", "v3", "bg", "d1", "d2"];
+        let mut out = Vec::new();
+        for line in raw.lines() {
+            let mut s = String::with_capacity(line.len());
+            let mut bracket = 0u8; // 0 = text, 1 = inside […], 2 = inside <…>
+            for ch in line.chars() {
+                match ch {
+                    '[' => bracket = 1,
+                    '<' => bracket = 2,
+                    ']' if bracket == 1 => bracket = 0,
+                    '>' if bracket == 2 => bracket = 0,
+                    c if bracket == 0 => s.push(c),
+                    _ => {}
+                }
+            }
+            let t = s.trim();
+            let t = match t.split_once(':') {
+                // a leading voice label like "v1:" before the words
+                Some((label, rest))
+                    if VOICE_LABELS.contains(&label.to_lowercase().as_str()) =>
+                {
+                    rest.trim()
+                }
+                _ => t,
+            };
+            out.push(t.to_string());
+        }
+        while out.last().is_some_and(|l| l.is_empty()) {
+            out.pop();
+        }
+        out.join("\n")
+    }
+
     /// Toggle the lyrics popup: reads the playing file's embedded lyrics tag
     /// through mpv's metadata property (zero network).
     pub async fn toggle_lyrics(&mut self, p: &mut Player) {
@@ -202,7 +240,7 @@ impl App {
                     .iter()
                     .find(|(k, _)| k.to_uppercase().contains("LYRICS"))
                     .map(|(_, v)| v.clone());
-                self.lyrics = Some(found.unwrap_or_else(|| {
+                self.lyrics = Some(found.map(|v| Self::clean_lyrics(&v)).unwrap_or_else(|| {
                     if self.status.as_ref().and_then(|s| s.path.as_ref()).is_some() {
                         "no lyrics found in this file's tags".into()
                     } else {
@@ -683,6 +721,34 @@ mod tests {
         app.refresh_status(&mut player).await;
         assert_eq!(app.message, None);
         assert!(app.loading.is_none());
+    }
+
+    #[test]
+    fn clean_lyrics_strips_lrc_timestamps_and_labels() {
+        // enhanced LRC (A2): line timestamps, duplicated word timestamps and
+        // voice labels (v1:/bg:) — the raw tag reads like garbage in the popup
+        let raw = concat!(
+            "[ti:(When You Gonna) Give It Up to Me]\n",
+            "[00:18.465]v1:<00:18.465>Through <00:19.102><00:19.102>drought <00:19.488><00:19.488>and famine\n",
+            "[00:21.818]v1:<00:21.818>Natural <00:22.784><00:22.784>disasters\n",
+            "[03:21.948]<bg:Don't <03:22.281><03:22.281>you love\n",
+        );
+        let cleaned = super::App::clean_lyrics(raw);
+        assert!(cleaned.contains("Through drought and famine"), "got: {cleaned}");
+        assert!(cleaned.contains("Natural disasters"));
+        assert!(cleaned.contains("you love"));
+        assert!(!cleaned.contains("00:18"), "timestamps must go: {cleaned}");
+        assert!(!cleaned.contains("v1:"));
+        assert!(!cleaned.contains("bg:"));
+        assert!(!cleaned.contains("[ti:"), "metadata headers must go");
+    }
+
+    #[test]
+    fn clean_lyrics_keeps_plain_text_intact() {
+        assert_eq!(
+            super::App::clean_lyrics("primera línea\n\nsegunda\n"),
+            "primera línea\n\nsegunda"
+        );
     }
 
     #[tokio::test]
