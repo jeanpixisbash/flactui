@@ -81,6 +81,87 @@ pub fn half_blocks(bytes: &[u8]) -> anyhow::Result<HalfBlocks> {
     Ok(HalfBlocks { w: GRID_W, h: GRID_H, cells })
 }
 
+/// Decoding errors surfaced to the popup.
+#[derive(Debug)]
+pub enum CoverError {
+    /// Valid FLAC, but the tags carry no picture.
+    NoPicture,
+    /// File unreadable, not a FLAC, or the picture failed to decode.
+    Unavailable(String),
+}
+impl std::fmt::Display for CoverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoverError::NoPicture => write!(f, "no embedded cover"),
+            CoverError::Unavailable(e) => write!(f, "cover unavailable: {e}"),
+        }
+    }
+}
+
+/// `~/.cache/flactui/covers` by default.
+pub fn default_cache_dir() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("flactui")
+        .join("covers")
+}
+
+/// Stable per-track cache file: hex hash of the absolute track path.
+pub fn cache_path(cache_dir: &std::path::Path, track_path: &str) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    track_path.hash(&mut h);
+    cache_dir.join(format!("{:016x}.img", h.finish()))
+}
+
+fn read_cached(cache_file: &std::path::Path) -> Option<Vec<u8>> {
+    std::fs::read(cache_file).ok()
+}
+
+fn store_cached(cache_dir: &std::path::Path, track_path: &str, bytes: &[u8]) {
+    let _ = std::fs::create_dir_all(cache_dir);
+    let _ = std::fs::write(cache_path(cache_dir, track_path), bytes);
+}
+
+/// Extract + decode the cover of `track_path`, using `cache_dir` when given.
+pub fn load_with_cache(
+    track_path: &str,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<HalfBlocks, CoverError> {
+    if let Some(dir) = cache_dir {
+        if let Some(bytes) = read_cached(&cache_path(dir, track_path)) {
+            if let Ok(g) = half_blocks(&bytes) {
+                return Ok(g);
+            }
+            // corrupt cache entry → fall through to re-extraction
+        }
+    }
+    let picture = std::fs::File::open(track_path)
+        .map_err(|e| CoverError::Unavailable(format!("open: {e}")))
+        .and_then(|mut f| {
+            flac_picture_bytes(&mut f)
+                .map_err(|e| CoverError::Unavailable(e.to_string()))
+                .and_then(|p| p.ok_or(CoverError::NoPicture))
+        })?;
+    if let Some(dir) = cache_dir {
+        store_cached(dir, track_path, &picture);
+    }
+    half_blocks(&picture).map_err(|e| CoverError::Unavailable(e.to_string()))
+}
+
+/// Extract + decode using the default cache directory.
+pub fn load(track_path: &str) -> Result<HalfBlocks, CoverError> {
+    load_with_cache(track_path, Some(&default_cache_dir()))
+}
+
+/// Track display name from a full path.
+pub fn track_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// METADATA_BLOCK_PICTURE wire format → raw image bytes (the embedded PNG/JPEG).
 fn decode_picture_block(payload: &[u8]) -> Vec<u8> {    let be32 = |off: usize| -> usize {
         u32::from_be_bytes([
@@ -205,5 +286,113 @@ mod tests {
     #[test]
     fn half_blocks_rejects_garbage() {
         assert!(half_blocks(b"notanimage").is_err());
+    }
+
+    // ---- load / cache ----
+
+    struct Counting<T> {
+        inner: T,
+        read_bytes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl<T: Read> Read for Counting<T> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read_bytes.set(self.read_bytes.get() + n);
+            Ok(n)
+        }
+    }
+
+    fn temp_cache_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!(
+            "flactui-covers-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_fixture(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let png = half_red_blue_png();
+        let p = dir.join(name);
+        std::fs::write(&p, flac_fixture(Some(&png), 200_000)).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_extracts_and_caches() {
+        let dir = temp_cache_dir("extract");
+        let p = write_fixture(&dir, "song.flac");
+        let cache = temp_cache_dir("cache1");
+        let g = load_with_cache(p.to_str().unwrap(), Some(&cache)).unwrap();
+        assert_eq!((g.w, g.h), (GRID_W, GRID_H));
+        // a cache file now exists
+        assert!(std::fs::read_dir(&cache).unwrap().next().is_some());
+    }
+
+    #[test]
+    fn load_uses_cache_without_reopening() {
+        let dir = temp_cache_dir("cachehit");
+        let p = write_fixture(&dir, "song.flac");
+        let cache = temp_cache_dir("cache2");
+        load_with_cache(p.to_str().unwrap(), Some(&cache)).unwrap();
+        // the FLAC is gone; the cache alone must satisfy a second load
+        std::fs::remove_file(&p).unwrap();
+        assert!(load_with_cache(p.to_str().unwrap(), Some(&cache)).is_ok());
+    }
+
+    #[test]
+    fn load_no_picture() {
+        let dir = temp_cache_dir("nopict");
+        let p = dir.join("song.flac");
+        std::fs::write(&p, flac_fixture(None, 10_000)).unwrap();
+        let cache = temp_cache_dir("cache3");
+        assert!(matches!(
+            load_with_cache(p.to_str().unwrap(), Some(&cache)),
+            Err(CoverError::NoPicture)
+        ));
+    }
+
+    #[test]
+    fn load_missing_file_unavailable() {
+        let cache = temp_cache_dir("cache4");
+        assert!(matches!(
+            load_with_cache("/nonexistent/song.flac", Some(&cache)),
+            Err(CoverError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn load_reads_only_metadata_prefix() {
+        let dir = temp_cache_dir("prefix");
+        let p = write_fixture(&dir, "song.flac"); // 200_000 trailing audio bytes
+        let cache = temp_cache_dir("cache5");
+        let read_bytes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = read_bytes.clone();
+        let mut counting = Counting {
+            inner: std::fs::File::open(&p).unwrap(),
+            read_bytes,
+        };
+        // exercise the same pipeline by parsing the counting reader directly
+        let pic = flac_picture_bytes(&mut counting).unwrap().unwrap();
+        let _ = half_blocks(&pic).unwrap();
+        assert!(
+            counter.get() < 4096 + 200,
+            "metadata-only read expected, read {} of {}",
+            counter.get(),
+            200_000
+        );
+    }
+
+    #[test]
+    fn load_without_writable_cache_still_extracts() {
+        let dir = temp_cache_dir("nocache");
+        let p = write_fixture(&dir, "song.flac");
+        // cache "dir" is a regular file → unwritable
+        let not_a_dir = dir.join("blocker");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        assert!(load_with_cache(p.to_str().unwrap(), Some(&not_a_dir)).is_ok());
     }
 }
