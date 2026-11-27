@@ -31,8 +31,55 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_playbar(f, app, chunks[1]);
 
+    if app.cover.is_some() {
+        draw_cover(f, app);
+    }
     if app.lyrics.is_some() {
         draw_lyrics(f, app);
+    }
+}
+
+/// Center-crop a grid coordinate into a popup cell area; None = skip cell.
+fn grid_offset(grid: u16, area: u16) -> i32 {
+    (i32::from(grid) - i32::from(area)) / 2
+}
+
+fn draw_cover(f: &mut Frame, app: &App) {
+    let area = centered_rect(60, 60, f.area());
+    f.render_widget(ratatui::widgets::Clear, area);
+    let (title, art) = match &app.cover {
+        Some(crate::app::CoverView::Ready { art, title }) => (title.as_str(), Some(art)),
+        Some(crate::app::CoverView::Plain(msg)) => (msg.as_str(), None),
+        None => return,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" cover · {title} "))
+        .border_style(Style::default().fg(ACCENT_2));
+    let inner = match block.inner(area) {
+        // too small to draw anything meaningful
+        i if i.width < 4 || i.height < 4 => return,
+        i => i,
+    };
+    f.render_widget(block, area);
+    let Some(art) = art else { return };
+    let ox = grid_offset(art.w, inner.width);
+    let oy = grid_offset(art.h, inner.height);
+    for row in 0..inner.height {
+        for col in 0..inner.width {
+            let gx = col as i32 + ox;
+            let gy = row as i32 + oy;
+            if gx < 0 || gy < 0 || gx >= i32::from(art.w) || gy >= i32::from(art.h) {
+                continue;
+            }
+            let cell = art.cells[gy as usize * art.w as usize + gx as usize];
+            f.buffer_mut()[(inner.x + col, inner.y + row)]
+                .set_symbol("▀")
+                .set_fg(ratatui::style::Color::Rgb(cell.top[0], cell.top[1], cell.top[2]))
+                .set_bg(ratatui::style::Color::Rgb(
+                    cell.bottom[0], cell.bottom[1], cell.bottom[2],
+                ));
+        }
     }
 }
 
@@ -182,7 +229,7 @@ fn draw_playbar(f: &mut Frame, app: &App, area: Rect) {
     // hints; volume hidden on very narrow terminals
     let hints = if area.width >= 60 {
         format!(
-            " j/k move · enter play · space pause · e queue · / search · tab · l lyrics · s shuffle · r repeat · ⇦⇨ seek  vol:{}%  q quit",
+            " j/k move · enter play · space pause · e queue · / search · tab · l lyrics · i cover · s shuffle · r repeat · ⇦⇨ seek  vol:{}%  q quit",
             app.volume
         )
     } else {
@@ -245,6 +292,68 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>()
             .replace('\n', "")
+    }
+
+    #[test]
+    fn cover_popup_renders_blocks_and_title() {
+        use crate::covers::{HalfBlocks, HalfCell};
+        let mut app = app_playing();
+        app.cover = Some(crate::app::CoverView::Ready {
+            art: HalfBlocks {
+                w: 4,
+                h: 4,
+                cells: vec![
+                    HalfCell {
+                        top: [255, 0, 0],
+                        bottom: [0, 0, 255],
+                    };
+                    16
+                ],
+            },
+            title: "Es Epico.flac".into(),
+        });
+        let text = render_at(100, 40, &app);
+        assert!(text.contains('▀'), "half-blocks expected, got: {text}");
+        assert!(text.contains("cover"), "title expected, got: {text}");
+        assert!(text.contains("Es Epico"), "track title expected, got: {text}");
+    }
+
+    #[test]
+    fn cover_popup_plain_message() {
+        let mut app = app_playing();
+        app.cover = Some(crate::app::CoverView::Plain("no embedded cover".into()));
+        let text = render_at(100, 40, &app);
+        assert!(text.contains("no embedded cover"), "got: {text}");
+        assert!(!text.contains('▀'), "no art expected, got: {text}");
+    }
+
+    #[test]
+    fn cover_popup_tiny_area_no_panic() {
+        use crate::covers::{HalfBlocks, HalfCell};
+        let mut app = app_playing();
+        app.cover = Some(crate::app::CoverView::Ready {
+            art: HalfBlocks {
+                w: 4,
+                h: 4,
+                cells: vec![
+                    HalfCell {
+                        top: [1, 2, 3],
+                        bottom: [4, 5, 6],
+                    };
+                    16
+                ],
+            },
+            title: "x.flac".into(),
+        });
+        // must not panic on a tiny terminal
+        let _ = render_at(20, 6, &app);
+    }
+
+    #[test]
+    fn cover_popup_closed_renders_nothing() {
+        let app = app_playing();
+        let text = render_at(100, 40, &app);
+        assert!(!text.contains('▀'));
     }
 
     #[test]
