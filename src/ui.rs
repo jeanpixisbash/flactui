@@ -87,22 +87,85 @@ fn draw_lyrics(f: &mut Frame, app: &App) {
     let area = centered_rect(70, 70, f.area());
     f.render_widget(ratatui::widgets::Clear, area); // wipe what's underneath
 
-    let text = app.lyrics.as_deref().unwrap_or("");
-    let n_lines = text.lines().count().max(1);
-    let inner_h = area.height.saturating_sub(2) as usize;
-    let max_off = n_lines.saturating_sub(inner_h);
-    let off = app.lyrics_scroll.min(max_off) as u16;
+    match &app.lyrics {
+        Some(crate::app::Lyrics::Timed(lines)) => {
+            draw_timed_lyrics(f, app, area, lines);
+        }
+        other => {
+            // Plain (or a stale None — nothing to draw then)
+            let text = match other {
+                Some(crate::app::Lyrics::Plain(t)) => t.as_str(),
+                _ => return,
+            };
+            let n_lines = text.lines().count().max(1);
+            let inner_h = area.height.saturating_sub(2) as usize;
+            let max_off = n_lines.saturating_sub(inner_h);
+            let off = app.lyrics_scroll.min(max_off) as u16;
 
-    let para = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" lyrics ({n_lines} lines · Esc closes) "))
-                .border_style(Style::default().fg(ACCENT_2)),
-        )
-        .style(Style::default().fg(Color::White))
-        .scroll((off, 0));
-    f.render_widget(para, area);
+            let para = Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" lyrics ({n_lines} lines · Esc closes) "))
+                        .border_style(Style::default().fg(ACCENT_2)),
+                )
+                .style(Style::default().fg(Color::White))
+                .scroll((off, 0));
+            f.render_widget(para, area);
+        }
+    }
+}
+
+/// Fade color for a line `d` rows away from the active one (pinned gradient:
+/// `ch = round(255 - (d-1)*195/4)` → 255 at d=1, 206 at d=2, 60 at d=5, floor 60).
+fn fade_fg(d: usize) -> Color {
+    let ch = (255.0 - (d as f64 - 1.0) * 195.0 / 4.0).round();
+    let ch = ch.max(60.0).min(255.0) as u8;
+    Color::Rgb(ch, ch, ch)
+}
+
+fn draw_timed_lyrics(f: &mut Frame, app: &App, area: Rect, lines: &crate::lyrics::LrcLines) {
+    let inner = {
+        let b = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" lyrics · synced ({}) · j/k browse · g top · Esc closes ", lines.lines.len()))
+            .border_style(Style::default().fg(ACCENT_2));
+        let i = b.inner(area);
+        f.render_widget(b, area);
+        i
+    };
+    if inner.height == 0 {
+        return;
+    }
+    let rows = inner.height as usize;
+    let half = rows / 2;
+    let active = app.lyrics_active.unwrap_or(0) as i32;
+    let center = (active + app.lyrics_offset).max(0);
+    // window: center - half .. center + half (clamped to the list)
+    let start = (center - half as i32).max(0) as usize;
+    let end = (center + half as i32).max(0) as usize;
+    let end = end.min(lines.lines.len());
+    let visible = &lines.lines[start..end];
+    // pad so `center` lands on the middle row of the popup
+    let center_row = (center - start as i32) as usize;
+    let top_pad = rows.saturating_sub(center_row + 1).min(rows.saturating_sub(visible.len()));
+
+    let mut rows_out: Vec<ratatui::text::Line> = Vec::with_capacity(rows);
+    for _ in 0..top_pad {
+        rows_out.push(ratatui::text::Line::from(""));
+    }
+    for (k, line) in visible.iter().enumerate() {
+        let idx = start + k;
+        let style = if Some(idx) == app.lyrics_active {
+            Style::default().fg(ACCENT_2).add_modifier(Modifier::BOLD)
+        } else {
+            let d = idx.abs_diff(app.lyrics_active.unwrap_or(idx));
+            Style::default().fg(fade_fg(d.max(1)))
+        };
+        rows_out.push(ratatui::text::Line::from(line.text.clone()).style(style));
+    }
+    let para = Paragraph::new(rows_out);
+    f.render_widget(para, inner);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -396,7 +459,7 @@ mod tests {
         let mut lines = vec!["primera".to_string()];
         lines.extend((2..=21).map(|i| format!("relleno {i}")));
         lines.push("última".to_string());
-        app.lyrics = Some(lines.join("\n"));
+        app.lyrics = Some(crate::app::Lyrics::Plain(lines.join("\n")));
         let text = render_at(120, 30, &app);
         assert!(text.contains("primera"), "popup should render: {text}");
         assert!(text.contains("lyrics"), "title bar");
@@ -407,6 +470,98 @@ mod tests {
         let scrolled = render_at(120, 30, &app);
         assert!(!scrolled.contains("primera"), "scrolled past first line");
         assert!(scrolled.contains("última"));
+    }
+
+    // ---- timed (karaoke-follow) lyrics ----
+
+    /// App with a 20-line Timed popup (times i*10 s, texts `line {i:02}`).
+    fn app_timed() -> App {
+        let mut app = app_playing();
+        let lines = (0..20)
+            .map(|i| crate::lyrics::LrcLine {
+                time: i as f64 * 10.0,
+                text: format!("line {i:02}"),
+            })
+            .collect();
+        app.lyrics = Some(crate::app::Lyrics::Timed(crate::lyrics::LrcLines { lines }));
+        app
+    }
+
+    #[test]
+    fn timed_centers_active_line() {
+        let mut app = app_timed();
+        app.status.as_mut().unwrap().time_pos = Some(100.0); // active = 10
+        app.sync_lyrics_follow();
+        let text = render_at(120, 30, &app);
+        assert!(text.contains("line 10"), "active line centered: {text}");
+    }
+
+    #[test]
+    fn timed_fade_gradient() {
+        let mut app = app_timed();
+        app.status.as_mut().unwrap().time_pos = Some(100.0);
+        app.sync_lyrics_follow();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // locate the active line by text (geometry-proof, no hardcoded rows)
+        let row_of = |needle: &str| -> Option<(u16, u16)> {
+            for y in 0..30u16 {
+                let mut acc = String::new();
+                for x in 0..120u16 {
+                    acc.push_str(buf[(x, y)].symbol());
+                    if acc.contains(needle) {
+                        return Some((x.saturating_sub(needle.len() as u16 - 1), y));
+                    }
+                }
+            }
+            None
+        };
+        let (x, active_row) = row_of("line 10").expect("active line rendered");
+        assert_eq!(buf[(x, active_row)].fg, ratatui::style::Color::Magenta, "active accent");
+        let d2 = buf[(x, active_row + 2)].fg;
+        assert_eq!(d2, ratatui::style::Color::Rgb(206, 206, 206), "fade at d=2");
+        let d5 = buf[(x, active_row + 5)].fg;
+        assert_eq!(d5, ratatui::style::Color::Rgb(60, 60, 60), "fade floor");
+    }
+
+    #[test]
+    fn timed_manual_offset_shifts() {
+        let mut app = app_timed();
+        app.status.as_mut().unwrap().time_pos = Some(100.0); // active 10
+        app.sync_lyrics_follow();
+        app.lyrics_offset = 3;
+        let text = render_at(120, 30, &app);
+        assert!(text.contains("line 13"), "offset shifts the window: {text}");
+    }
+
+    #[test]
+    fn timed_g_shows_top() {
+        let mut app = app_timed();
+        app.status.as_mut().unwrap().time_pos = Some(100.0); // active 10
+        app.sync_lyrics_follow();
+        app.lyrics_offset = -10; // center = 0 → list top at window top
+        let text = render_at(120, 30, &app);
+        assert!(text.contains("line 00"), "g shows the list top: {text}");
+        assert!(!text.contains("line 10"), "active scrolled out of view");
+    }
+
+    #[test]
+    fn timed_without_time_pos_renders_from_top() {
+        let mut app = app_timed();
+        app.status.as_mut().unwrap().time_pos = None;
+        app.sync_lyrics_follow();
+        let text = render_at(120, 30, &app);
+        assert!(text.contains("line 00"), "list from the top: {text}");
+    }
+
+    #[test]
+    fn timed_tiny_area_no_panic() {
+        let mut app = app_timed();
+        app.status.as_mut().unwrap().time_pos = Some(100.0);
+        app.sync_lyrics_follow();
+        let _ = render_at(20, 6, &app);
     }
 
     #[test]

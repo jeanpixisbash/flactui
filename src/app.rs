@@ -12,10 +12,16 @@ pub enum View {
     Queue,
 }
 
+/// Lyrics popup content: timed (karaoke-follow) or plain text.
+#[derive(Debug)]
+pub enum Lyrics {
+    Timed(crate::lyrics::LrcLines),
+    Plain(String),
+}
+
 /// What the cover popup shows: the decoded art or a plain message.
 #[derive(Debug)]
-pub enum CoverView {
-    Ready {
+pub enum CoverView {    Ready {
         art: crate::covers::HalfBlocks,
         title: String,
     },
@@ -45,9 +51,13 @@ pub struct App {
     pub volume: i64,
     pub shuffle: bool,
     pub repeat: bool,
-    /// lyrics popup: Some(text) = open
-    pub lyrics: Option<String>,
+    /// lyrics popup: Some(view) = open
+    pub lyrics: Option<Lyrics>,
     pub lyrics_scroll: usize,
+    /// Timed-only manual offset from the centered active line
+    pub lyrics_offset: i32,
+    /// cached active line index (drives the follow reset)
+    pub lyrics_active: Option<usize>,
     /// track we asked mpv to load, until status confirms it (loading feedback)
     pub loading: Option<String>,
     /// cover popup: Some(view) = open
@@ -79,6 +89,8 @@ impl App {
             repeat: false,
             lyrics: None,
             lyrics_scroll: 0,
+            lyrics_offset: 0,
+            lyrics_active: None,
             loading: None,
             cover: None,
             cover_rx: None,
@@ -201,6 +213,7 @@ impl App {
                 self.shuffle = st.shuffle;
                 self.repeat = st.loop_playlist != "no";
                 self.status = Some(st);
+                self.sync_lyrics_follow();
             }
             Err(e) => {
                 let msg = format!("{e}");
@@ -257,6 +270,8 @@ impl App {
         if self.lyrics.is_some() {
             self.lyrics = None;
             self.lyrics_scroll = 0;
+            self.lyrics_offset = 0;
+            self.lyrics_active = None;
             return;
         }
         match p.metadata().await {
@@ -265,16 +280,37 @@ impl App {
                     .iter()
                     .find(|(k, _)| k.to_uppercase().contains("LYRICS"))
                     .map(|(_, v)| v.clone());
-                self.lyrics = Some(found.map(|v| Self::clean_lyrics(&v)).unwrap_or_else(|| {
-                    if self.status.as_ref().and_then(|s| s.path.as_ref()).is_some() {
-                        "no lyrics found in this file's tags".into()
-                    } else {
-                        "nothing playing".into()
+                self.lyrics = Some(match found {
+                    Some(tag) => match crate::lyrics::parse_lrc(&tag) {
+                        Some(lines) => Lyrics::Timed(lines),
+                        None => Lyrics::Plain(Self::clean_lyrics(&tag)),
+                    },
+                    None if self.status.as_ref().and_then(|s| s.path.as_ref()).is_some() => {
+                        Lyrics::Plain("no lyrics found in this file's tags".into())
                     }
-                }));
+                    None => Lyrics::Plain("nothing playing".into()),
+                });
                 self.lyrics_scroll = 0;
+                self.lyrics_offset = 0;
+                self.lyrics_active = None;
             }
             Err(e) => self.message = Some(format!("player error: {e}")),
+        }
+    }
+
+    /// Timed lyrics: cache the active line; when it advances, drop the manual
+    /// offset so the view re-follows the song.
+    pub fn sync_lyrics_follow(&mut self) {
+        let Some(Lyrics::Timed(lines)) = &self.lyrics else { return };
+        let time_pos = self.status.as_ref().and_then(|s| s.time_pos);
+        let Some(t) = time_pos else {
+            self.lyrics_active = None;
+            return;
+        };
+        let new_active = crate::lyrics::active_line(lines, t);
+        if new_active != self.lyrics_active {
+            self.lyrics_active = new_active;
+            self.lyrics_offset = 0;
         }
     }
 
@@ -354,13 +390,21 @@ impl App {
         }
         // lyrics popup consumes keys while open
         if self.lyrics.is_some() {
-            match key.code {
-                KeyCode::Char('j') | KeyCode::Down => self.lyrics_scroll += 1,
-                KeyCode::Char('k') | KeyCode::Up => self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1),
-                KeyCode::Char('g') => self.lyrics_scroll = 0,
-                KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('q') => {
+            match (&self.lyrics, key.code) {
+                (Some(Lyrics::Plain(_)), KeyCode::Char('j') | KeyCode::Down) => self.lyrics_scroll += 1,
+                (Some(Lyrics::Plain(_)), KeyCode::Char('k') | KeyCode::Up) => {
+                    self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1)
+                }
+                (Some(Lyrics::Plain(_)), KeyCode::Char('g')) => self.lyrics_scroll = 0,
+                (Some(Lyrics::Timed(_)), KeyCode::Char('j') | KeyCode::Down) => self.lyrics_offset += 1,
+                (Some(Lyrics::Timed(_)), KeyCode::Char('k') | KeyCode::Up) => self.lyrics_offset -= 1,
+                (Some(Lyrics::Timed(_)), KeyCode::Char('g')) => {
+                    self.lyrics_offset = -(self.lyrics_active.unwrap_or(0) as i32);
+                }
+                (_, KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('q')) => {
                     self.lyrics = None;
                     self.lyrics_scroll = 0;
+                    self.lyrics_offset = 0;
                 }
                 _ => {}
             }
@@ -761,9 +805,12 @@ mod tests {
         .await;
         let mut app = app_with(&["a.flac"]);
 
-        // 'l' abre el pop-up con la letra del tag LYRICS
+        // 'l' abre el pop-up con la letra del tag LYRICS (plain: sin timestamps)
         app.on_key(key('l'), &mut player).await;
-        assert_eq!(app.lyrics.as_deref(), Some("verso 1\nverso 2\nverso 3"));
+        assert!(matches!(
+            app.lyrics,
+            Some(super::Lyrics::Plain(ref t)) if t == "verso 1\nverso 2\nverso 3"
+        ));
 
         // j/k hacen scroll
         app.on_key(key('j'), &mut player).await;
@@ -789,7 +836,10 @@ mod tests {
         let mut app = app_with(&["sin letra.flac"]);
         app.refresh_status(&mut player).await;
         app.on_key(key('l'), &mut player).await;
-        assert_eq!(app.lyrics.as_deref(), Some("no lyrics found in this file's tags"));
+        assert!(matches!(
+            app.lyrics,
+            Some(super::Lyrics::Plain(ref t)) if t == "no lyrics found in this file's tags"
+        ));
     }
 
     #[tokio::test]
@@ -797,7 +847,10 @@ mod tests {
         let (mut player, _log) = fake_player(serde_json::json!({})).await;
         let mut app = app_with(&["a.flac"]);
         app.on_key(key('l'), &mut player).await;
-        assert_eq!(app.lyrics.as_deref(), Some("nothing playing"));
+        assert!(matches!(
+            app.lyrics,
+            Some(super::Lyrics::Plain(ref t)) if t == "nothing playing"
+        ));
     }
 
     #[tokio::test]
@@ -1006,6 +1059,102 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         app.poll_cover();
         assert!(app.cover.is_none());
+    }
+
+    /// PlayerStatus with a given time_pos (tests).
+    fn status_at(time: f64) -> crate::player::PlayerStatus {
+        crate::player::PlayerStatus {
+            paused: false,
+            time_pos: Some(time),
+            duration: Some(300.0),
+            path: Some("/m/x.flac".into()),
+            playlist_pos: Some(0),
+            playlist: vec![],
+            volume: Some(100),
+            shuffle: false,
+            loop_playlist: "no".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn toggle_lyrics_stores_timed() {
+        let raw = "[00:18.465]Through drought\n[00:21.818]Natural disasters\n";
+        let (mut player, _log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100,
+            "metadata": {"TITLE": "x", "LYRICS": raw}
+        }))
+        .await;
+        let mut app = app_with(&["x.flac"]);
+        app.toggle_lyrics(&mut player).await;
+        assert!(matches!(
+            app.lyrics,
+            Some(super::Lyrics::Timed(ref l)) if l.lines.len() == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn toggle_lyrics_plain_fallback() {
+        let (mut player, _log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100,
+            "LYRICS": "primera línea\nsegunda\n"
+        }))
+        .await;
+        let mut app = app_with(&["x.flac"]);
+        app.toggle_lyrics(&mut player).await;
+        assert!(matches!(app.lyrics, Some(super::Lyrics::Plain(_))));
+    }
+
+    #[test]
+    fn follow_resets_offset_on_advance() {
+        let mut app = app_with(&[]);
+        app.lyrics = Some(super::Lyrics::Timed(crate::lyrics::parse_lrc(
+            "[00:10.00]a\n[00:20.00]b\n[00:30.00]c\n",
+        ).unwrap()));
+        app.lyrics_active = None;
+        app.lyrics_offset = 7;
+        app.status = Some(status_at(25.0));
+        app.sync_lyrics_follow();
+        assert_eq!(app.lyrics_active, Some(1));
+        assert_eq!(app.lyrics_offset, 0, "offset resets when the line advances");
+        // same time → nothing resets
+        app.lyrics_offset = 4;
+        app.sync_lyrics_follow();
+        assert_eq!(app.lyrics_offset, 4);
+        // advance → reset again
+        app.status = Some(status_at(35.0));
+        app.sync_lyrics_follow();
+        assert_eq!(app.lyrics_active, Some(2));
+        assert_eq!(app.lyrics_offset, 0);
+    }
+
+    #[test]
+    fn manual_offset_kept_between_ticks() {
+        let mut app = app_with(&[]);
+        app.lyrics = Some(super::Lyrics::Timed(crate::lyrics::parse_lrc(
+            "[00:10.00]a\n[00:20.00]b\n",
+        ).unwrap()));
+        app.status = Some(status_at(25.0));
+        app.lyrics_active = Some(1);
+        app.lyrics_offset = 4;
+        app.sync_lyrics_follow();
+        assert_eq!(app.lyrics_offset, 4);
+        assert_eq!(app.lyrics_active, Some(1));
+    }
+
+    #[tokio::test]
+    async fn g_jumps_to_list_top() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&[]);
+        let raw = (0..20)
+            .map(|i| format!("[{:02}:{:02}.00]line {i:02}", i / 2, (i % 2) * 30))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        app.lyrics = Some(super::Lyrics::Timed(crate::lyrics::parse_lrc(&raw).unwrap()));
+        app.lyrics_active = Some(10);
+        app.lyrics_offset = 3;
+        app.on_key(key('g'), &mut player).await;
+        assert_eq!(app.lyrics_offset, -10);
     }
 
     #[tokio::test]
