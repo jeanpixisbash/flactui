@@ -12,6 +12,15 @@ pub enum View {
     Queue,
 }
 
+/// What the cover popup shows: the decoded art or a plain message.
+pub enum CoverView {
+    Ready {
+        art: crate::covers::HalfBlocks,
+        title: String,
+    },
+    Plain(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Action {
     None,
@@ -40,6 +49,8 @@ pub struct App {
     pub lyrics_scroll: usize,
     /// track we asked mpv to load, until status confirms it (loading feedback)
     pub loading: Option<String>,
+    /// cover popup: Some(view) = open
+    pub cover: Option<CoverView>,
 }
 
 impl App {
@@ -66,6 +77,7 @@ impl App {
             lyrics: None,
             lyrics_scroll: 0,
             loading: None,
+            cover: None,
         }
     }
 
@@ -262,9 +274,52 @@ impl App {
         }
     }
 
+    /// Toggle the cover popup: extracts the embedded album art of the
+    /// playing (or selected) track. Decode work runs off the UI thread.
+    pub async fn toggle_cover(&mut self, p: &mut Player) {
+        if self.cover.is_some() {
+            self.cover = None;
+            return;
+        }
+        let path = self
+            .status
+            .as_ref()
+            .and_then(|s| s.path.clone())
+            .or_else(|| self.selected().map(String::from));
+        let Some(path) = path else {
+            self.cover = Some(CoverView::Plain("nothing playing".into()));
+            return;
+        };
+        let title = crate::covers::track_name(&path);
+        let res = tokio::task::spawn_blocking(move || {
+            // v1: FLAC covers only — other formats read as "no embedded cover"
+            if !path.to_lowercase().ends_with(".flac") {
+                return Err(crate::covers::CoverError::NoPicture);
+            }
+            crate::covers::load(&path)
+        })
+        .await;
+        self.cover = Some(match res {
+            Ok(Ok(art)) => CoverView::Ready { art, title },
+            Ok(Err(crate::covers::CoverError::NoPicture)) => {
+                CoverView::Plain("no embedded cover".into())
+            }
+            Ok(Err(e)) => CoverView::Plain(e.to_string()),
+            Err(e) => CoverView::Plain(format!("cover unavailable: {e}")),
+        });
+    }
+
     pub async fn on_key(&mut self, key: KeyEvent, p: &mut Player) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
+        }
+        // cover popup consumes keys while open
+        if self.cover.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => self.cover = None,
+                _ => {}
+            }
+            return Action::None;
         }
         // lyrics popup consumes keys while open
         if self.lyrics.is_some() {
@@ -322,6 +377,7 @@ impl App {
                 KeyCode::Char('s') => { let _ = p.toggle_shuffle().await; }
                 KeyCode::Char('r') => { let _ = p.toggle_repeat().await; }
                 KeyCode::Char('l') => self.toggle_lyrics(p).await,
+                KeyCode::Char('i') => self.toggle_cover(p).await,
                 KeyCode::Char('+') | KeyCode::Char('=') => {
                     self.volume = (self.volume + 5).min(130);
                     let _ = p.set_volume(self.volume).await;
@@ -366,6 +422,7 @@ impl App {
                 KeyCode::Enter => {
                     let _ = p.playlist_play_index(self.queue_cursor).await;
                 }
+                KeyCode::Char('i') => self.toggle_cover(p).await,
                 KeyCode::Char('D') => {
                     let _ = p.playlist_clear().await;
                     self.queue_cursor = 0;
@@ -789,6 +846,67 @@ mod tests {
         );
         // two successful appends happened
         assert_eq!(_log.lock().await.iter().filter(|c| c.contains("loadfile")).count(), 4);
+    }
+
+    #[tokio::test]
+    async fn cover_toggle_nothing_playing_shows_plain() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        // empty library, nothing playing → no track to read a cover from
+        let mut app = app_with(&[]);
+        app.toggle_cover(&mut player).await;
+        assert!(matches!(
+            app.cover,
+            Some(super::CoverView::Plain(ref m)) if m.contains("nothing playing")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cover_toggle_missing_file_shows_unavailable() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["missing.flac"]);
+        app.toggle_cover(&mut player).await;
+        assert!(matches!(
+            app.cover,
+            Some(super::CoverView::Plain(ref m)) if m.contains("cover unavailable")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cover_toggle_closes() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["missing.flac"]);
+        app.toggle_cover(&mut player).await;
+        assert!(app.cover.is_some());
+        app.toggle_cover(&mut player).await;
+        assert!(app.cover.is_none());
+    }
+
+    #[tokio::test]
+    async fn cover_popup_consumes_keys() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["missing.flac"]);
+        app.toggle_cover(&mut player).await;
+        // unknown key while open: consumed, popup stays
+        app.on_key(key('x'), &mut player).await;
+        assert!(app.cover.is_some());
+        // Esc closes
+        app.on_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut player,
+        )
+        .await;
+        assert!(app.cover.is_none());
+    }
+
+    #[tokio::test]
+    async fn cover_toggle_non_flac_reports_missing() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["song.m4a"]);
+        app.toggle_cover(&mut player).await;
+        assert!(matches!(
+            app.cover,
+            Some(super::CoverView::Plain(ref m)) if m.contains("no embedded cover")
+        ));
     }
 
     #[tokio::test]
