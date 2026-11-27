@@ -17,13 +17,18 @@ truecolor — works in alacritty (no sixel/kitty protocol needed).
 
 ## Data path
 1. Take the path of the track (playing one if any, else the selected one).
-2. Read the tag with `lofty` (default-features off; only `flac` + `m4a`
-   features) → embedded picture bytes (`METADATA_BLOCK_PICTURE` / `covr`).
-3. Cache the extracted picture bytes in `~/.cache/flactui/covers/<blake3-ish
-   hash of path>.<ext>` — subsequent opens are instant, no FUSE re-read.
-4. Decode with `image` (jpeg+png only), resize to the popup's pixel size
-   (`cols × (rows*2)`, Triangle filter), render one half-block per cell:
-   top pixel = fg, bottom pixel = bg, char `▀`.
+2. Extract the FLAC `METADATA_BLOCK_PICTURE` by hand (std-only parser in
+   `covers.rs`; **plan deviation, decided during planning:** the `lofty`
+   crate was dropped — the hand parser is ~40 lines, testable with a
+   synthetic fixture, and avoids a heavy dep tree. Consequence: **FLAC
+   covers only in v1** — m4a shows `no embedded cover`; 13 of 591 library
+   tracks). Only the metadata prefix is read, never the audio stream.
+3. Cache the extracted picture bytes in `~/.cache/flactui/covers/<hash of
+   path>.img` — subsequent opens are instant, no FUSE re-read.
+4. Decode with `image` (jpeg+png only), resize to the fixed grid
+   (48×24 cells = 48×48 px, Triangle filter), render one half-block per
+   cell: top pixel = fg, bottom pixel = bg, char `▀`. The popup center-crops
+   the fixed grid every frame (cheap), so no re-resize on terminal resize.
 
 ## Render rule (ratatui)
 For each cell: `Style::new().fg(top_rgb).bg(bottom_rgb)`, symbol `▀`.
