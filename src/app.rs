@@ -460,10 +460,14 @@ impl App {
                     self.attempt_remount().await;
                 }
                 KeyCode::Char('n') => {
-                    let _ = p.next().await;
+                    if self.ensure_mount().await {
+                        let _ = p.next().await;
+                    }
                 }
                 KeyCode::Char('p') => {
-                    let _ = p.previous().await;
+                    if self.ensure_mount().await {
+                        let _ = p.previous().await;
+                    }
                 }
                 KeyCode::Char(' ') => {
                     let _ = p.toggle_pause().await;
@@ -489,11 +493,15 @@ impl App {
                     return Action::None;
                 }
                 (_, KeyCode::Char('n')) => {
-                    let _ = p.next().await;
+                    if self.ensure_mount().await {
+                        let _ = p.next().await;
+                    }
                     return Action::None;
                 }
                 (_, KeyCode::Char('p')) => {
-                    let _ = p.previous().await;
+                    if self.ensure_mount().await {
+                        let _ = p.previous().await;
+                    }
                     return Action::None;
                 }
                 (_, KeyCode::Char(' ')) => {
@@ -564,8 +572,16 @@ impl App {
                 KeyCode::Char('a') => self.enqueue_all_filtered(p).await,
                 KeyCode::Char('/') => self.search = Some(String::new()),
                 KeyCode::Tab => self.view = View::Queue,
-                KeyCode::Char('n') => { let _ = p.next().await; }
-                KeyCode::Char('p') => { let _ = p.previous().await; }
+                KeyCode::Char('n') => {
+                    if self.ensure_mount().await {
+                        let _ = p.next().await;
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if self.ensure_mount().await {
+                        let _ = p.previous().await;
+                    }
+                }
                 KeyCode::Left => { let _ = p.seek(-10.0).await; }
                 KeyCode::Right => { let _ = p.seek(10.0).await; }
                 KeyCode::Char('s') => { let _ = p.toggle_shuffle().await; }
@@ -624,8 +640,16 @@ impl App {
                     let _ = p.playlist_clear().await;
                     self.queue_cursor = 0;
                 }
-                KeyCode::Char('n') => { let _ = p.next().await; }
-                KeyCode::Char('p') => { let _ = p.previous().await; }
+                KeyCode::Char('n') => {
+                    if self.ensure_mount().await {
+                        let _ = p.next().await;
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if self.ensure_mount().await {
+                        let _ = p.previous().await;
+                    }
+                }
                 KeyCode::Left => { let _ = p.seek(-10.0).await; }
                 KeyCode::Right => { let _ = p.seek(10.0).await; }
                 KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -1395,6 +1419,21 @@ mod tests {
         app.on_key(key('R'), &mut player).await;
         assert!(app.mount_ok);
         assert!(app.lyrics.is_some(), "popup stays open");
+    }
+
+    #[tokio::test]
+    async fn n_key_with_dead_mount_remounts_before_skipping() {
+        let (mut player, log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["a.flac"]);
+        app.phone_mount = Some("/nonexistent-flactui-test".into());
+        app.mount_ok = false;
+        app.remount_ok = Some(true);
+        app.on_key(key('n'), &mut player).await;
+        assert!(app.mount_ok, "n must remount first");
+        assert!(
+            log.lock().await.iter().any(|c| c.contains("playlist-next")),
+            "skip proceeds after remount"
+        );
     }
 
     #[tokio::test]
