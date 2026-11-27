@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 anyhow = "1.0.105"
 crossterm = "0.29.0"
 dirs = "7.0.0"

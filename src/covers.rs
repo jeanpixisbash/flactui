@@ -37,9 +37,52 @@ pub fn flac_picture_bytes(r: &mut impl Read) -> anyhow::Result<Option<Vec<u8>>> 
     }
 }
 
+/// Popup grid size in cells; each cell paints 2 vertical pixels (half-blocks).
+pub const GRID_W: u16 = 48;
+pub const GRID_H: u16 = 24;
+
+/// One rendered cell: top pixel = foreground, bottom pixel = background.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct HalfCell {
+    pub top: [u8; 3],
+    pub bottom: [u8; 3],
+}
+
+/// A decoded cover as a fixed-size row-major grid of half-block cells.
+#[derive(Clone, Debug)]
+pub struct HalfBlocks {
+    pub w: u16,
+    pub h: u16,
+    pub cells: Vec<HalfCell>,
+}
+
+/// Decode an image (PNG/JPEG bytes) and resize it into the fixed grid of
+/// half-block cells (top pixel = fg, bottom pixel = bg per cell).
+pub fn half_blocks(bytes: &[u8]) -> anyhow::Result<HalfBlocks> {
+    let img = image::load_from_memory(bytes)?;
+    // each cell = 1 horizontal pixel, 2 vertical pixels (half-blocks)
+    let px_w = GRID_W as u32;
+    let px_h = GRID_H as u32 * 2;
+    let resized = image::imageops::resize(&img, px_w, px_h, image::imageops::FilterType::Triangle);
+    let rgb = image::DynamicImage::ImageRgba8(resized).to_rgb8();
+    let mut cells = Vec::with_capacity((GRID_W as usize) * (GRID_H as usize));
+    for cy in 0..GRID_H {
+        for cx in 0..GRID_W {
+            let px = |x: u32, y: u32| -> [u8; 3] {
+                let p = rgb.get_pixel(x, y).0;
+                [p[0], p[1], p[2]]
+            };
+            let x = cx as u32;
+            let top = px(x, cy as u32 * 2);
+            let bottom = px(x, cy as u32 * 2 + 1);
+            cells.push(HalfCell { top, bottom });
+        }
+    }
+    Ok(HalfBlocks { w: GRID_W, h: GRID_H, cells })
+}
+
 /// METADATA_BLOCK_PICTURE wire format → raw image bytes (the embedded PNG/JPEG).
-fn decode_picture_block(payload: &[u8]) -> Vec<u8> {
-    let be32 = |off: usize| -> usize {
+fn decode_picture_block(payload: &[u8]) -> Vec<u8> {    let be32 = |off: usize| -> usize {
         u32::from_be_bytes([
             payload[off],
             payload[off + 1],
@@ -128,5 +171,39 @@ mod tests {
     #[test]
     fn flac_picture_rejects_bad_magic() {
         assert!(flac_picture_bytes(&mut b"notfLaC-something".as_slice()).is_err());
+    }
+
+    /// 16×16 PNG: left half red, right half blue.
+    fn half_red_blue_png() -> Vec<u8> {
+        use image::{ImageBuffer, ImageFormat, Rgb, RgbImage};
+        let mut img: RgbImage = ImageBuffer::new(16, 16);
+        for (x, _, px) in img.enumerate_pixels_mut() {
+            *px = if x < 8 { Rgb([255, 0, 0]) } else { Rgb([0, 0, 255]) };
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn half_blocks_size_is_grid() {
+        let g = half_blocks(&half_red_blue_png()).unwrap();
+        assert_eq!((g.w, g.h), (GRID_W, GRID_H));
+        assert_eq!(g.cells.len(), (GRID_W as usize) * (GRID_H as usize));
+    }
+
+    #[test]
+    fn half_blocks_colors_split() {
+        let g = half_blocks(&half_red_blue_png()).unwrap();
+        let at = |x: u16, y: u16| g.cells[(y as usize) * g.w as usize + x as usize].top;
+        let red = at(2, 2);
+        let blue = at(46, 2);
+        assert!(red[0] > 200 && red[1] < 60 && red[2] < 60, "left ≈ red, got {red:?}");
+        assert!(blue[2] > 200 && blue[0] < 60 && blue[1] < 60, "right ≈ blue, got {blue:?}");
+    }
+
+    #[test]
+    fn half_blocks_rejects_garbage() {
+        assert!(half_blocks(b"notanimage").is_err());
     }
 }
