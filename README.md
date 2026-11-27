@@ -69,7 +69,7 @@ flactui --keep-mounted   # skip the unmount prompt on exit
 | `n` / `p` | next / previous track (both views) |
 | `←` / `→` | seek −10 s / +10 s |
 | `s` / `r` | toggle shuffle / repeat |
-| `l` | lyrics popup (embedded tags; `j`/`k` scroll, `Esc` closes) |
+| `l` | synced lyrics popup — the singing line stays centered with a distance fade (embedded LRC timestamps; plain lyrics scroll as before, `j`/`k` browse, `g` top, `Esc` closes) |
 | `i` | cover popup — album art rendered large in truecolor half-blocks (embedded FLAC art, cached in `~/.cache/flactui/covers/`) |
 | `+` / `-` | volume (both views) |
 | `q` | quit (offers to unmount the phone) |
