@@ -32,6 +32,28 @@ pub fn music_dir(phone: &Phone) -> std::path::PathBuf {
 const DEST: &str = "org.kde.kdeconnect";
 const SFTP_IFACE: &str = "org.kde.kdeconnect.device.sftp";
 
+
+/// `/proc/mounts` line fields are space-separated; the mount point is the
+/// second field. Exact field match (a prefix path must NOT count).
+fn mounts_contain(content: &str, mp: &std::path::Path) -> bool {
+    let want = mp.to_string_lossy();
+    content.lines().any(|l| {
+        l.split_whitespace()
+            .nth(1)
+            .map(|m| m == want.as_ref())
+            .unwrap_or(false)
+    })
+}
+
+/// Is the SFTP mount still mounted? Reading `/proc/mounts` never blocks —
+/// unlike stat(), which can hang forever on a dead FUSE mount.
+pub fn mount_alive(mp: &std::path::Path) -> bool {
+    match std::fs::read_to_string("/proc/mounts") {
+        Ok(c) => mounts_contain(&c, mp),
+        Err(_) => false,
+    }
+}
+
 /// Find the first reachable paired device and mount its SFTP share.
 pub async fn connect() -> anyhow::Result<Phone> {
     match connect_on_bus(None).await {
@@ -177,5 +199,20 @@ mod tests {
             music_dir_in(&phone, "Music"),
             std::path::PathBuf::from("/run/user/1000/dev/Music")
         );
+    }
+
+    #[test]
+    fn mounts_contain_finds_exact_mount() {
+        let content = "sysfs /sys sysfs rw\n/dev/sda1 / ext4 rw\nfuse /run/user/1000/dev fuse.rw\n";
+        assert!(mounts_contain(content, std::path::Path::new("/run/user/1000/dev")));
+        assert!(!mounts_contain(content, std::path::Path::new("/run/user/1000")));
+        assert!(!mounts_contain(content, std::path::Path::new("/run/user/1000/dev/sub")));
+        assert!(!mounts_contain("", std::path::Path::new("/run/user/1000/dev")));
+    }
+
+    #[test]
+    fn mount_alive_false_when_not_in_proc_mounts() {
+        // a directory that exists but is never a mountpoint
+        assert!(!mount_alive(std::path::Path::new("/nonexistent-flactui-test")));
     }
 }

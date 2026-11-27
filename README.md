@@ -69,14 +69,19 @@ flactui --keep-mounted   # skip the unmount prompt on exit
 | `n` / `p` | next / previous track (both views) |
 | `←` / `→` | seek −10 s / +10 s |
 | `s` / `r` | toggle shuffle / repeat |
+| `R` | reconnect the phone (remount the SFTP share) — automatic before every play if the mount died |
 | `l` | synced lyrics popup — the singing line stays centered with a distance fade (embedded LRC timestamps; plain lyrics scroll as before, `j`/`k` browse, `g` top, `Esc` closes) |
 | `i` | cover popup — album art rendered large in truecolor half-blocks (embedded FLAC art, cached in `~/.cache/flactui/covers/`) |
 | `+` / `-` | volume (both views) |
 | `q` | quit (offers to unmount the phone) |
 
 Both popups (`l`, `i`) are fullscreen; playback keys still work inside them:
-`space` pause, `n`/`p` skip, `+`/`-` volume. `Esc` (or the same key) returns to
-the library.
+`space` pause, `n`/`p` skip, `+`/`-` volume, `R` reconnect. `Esc` (or the same
+key) returns to the library.
+
+If the phone's SFTP mount dies (dozing phone), playback fails silently —
+flactui now detects it and remounts automatically before playing; the playbar
+shows `phone disconnected — press R` when the phone is unreachable.
 
 In the queue view: `d` removes a track, `J`/`K` move it down/up, `Enter` jumps
 to it, `D` clears the queue.

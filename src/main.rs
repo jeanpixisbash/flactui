@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut player = Player::spawn().await.context("failed to start mpv")?;
     let mut app = App::new(music, tracks);
+    app.phone_mount = Some(phone.mount_point);
 
     // terminal setup (restore guaranteed below)
     enable_raw_mode()?;

@@ -248,7 +248,13 @@ fn draw_playbar(f: &mut Frame, app: &App, area: Rect) {
     let title = st
         .and_then(|s| s.path.as_deref())
         .map(file_display)
-        .unwrap_or("(nothing playing)")
+        .unwrap_or_else(|| {
+            if app.mount_ok {
+                "(nothing playing)"
+            } else {
+                "(phone disconnected — press R)"
+            }
+        })
         .to_string();
 
     let (pos, dur) = (
@@ -622,6 +628,19 @@ mod tests {
         assert!(
             !text.contains("library ("),
             "cover fullscreen must hide the library behind: {text}"
+        );
+    }
+
+    #[test]
+    fn playbar_reports_dead_mount_honestly() {
+        let mut app = app_playing();
+        app.status = None; // mpv idle
+        app.phone_mount = Some("/nonexistent-flactui-test".into());
+        app.mount_ok = false;
+        let text = render_at(120, 30, &app);
+        assert!(
+            text.contains("phone disconnected — press R"),
+            "honest playbar message: {text}"
         );
     }
 

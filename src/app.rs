@@ -60,6 +60,13 @@ pub struct App {
     pub lyrics_active: Option<usize>,
     /// track we asked mpv to load, until status confirms it (loading feedback)
     pub loading: Option<String>,
+    /// SFTP mount point of the phone (set at startup; drives remount checks)
+    pub phone_mount: Option<std::path::PathBuf>,
+    /// last known mount health (refreshed each status poll)
+    pub mount_ok: bool,
+    #[cfg(test)]
+    /// test override: Some(ok) makes remount() return `ok` without D-Bus
+    pub remount_ok: Option<bool>,
     /// cover popup: Some(view) = open
     pub cover: Option<CoverView>,
     /// in-flight cover decode job (background; polled by the event loop)
@@ -92,6 +99,10 @@ impl App {
             lyrics_offset: 0,
             lyrics_active: None,
             loading: None,
+            phone_mount: None,
+            mount_ok: true,
+            #[cfg(test)]
+            remount_ok: None,
             cover: None,
             cover_rx: None,
         }
@@ -145,7 +156,58 @@ impl App {
         self.message = Some(format!("loading {}…", Self::track_name(path)));
     }
 
+    /// Pure check: is our phone mount gone from /proc/mounts?
+    fn mount_needs_remount(&self) -> bool {
+        match &self.phone_mount {
+            Some(mp) => !crate::kde::mount_alive(mp),
+            None => false, // no phone info (tests) → don't block playback
+        }
+    }
+
+    /// Re-run device discovery + SFTP mount (wakes a dozing phone too).
+    async fn remount(&mut self) -> bool {
+        #[cfg(test)]
+        if let Some(ok) = self.remount_ok {
+            return ok;
+        }
+        match crate::kde::connect().await {
+            // the mount point is deterministic (/run/user/1000/<device>), so
+            // the library paths built at startup stay valid
+            Ok(phone) => {
+                self.phone_mount = Some(phone.mount_point);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Force a remount attempt with user feedback (pre-flight and the `R` key).
+    async fn attempt_remount(&mut self) -> bool {
+        self.message = Some("phone connection lost — remounting…".into());
+        if self.remount().await {
+            self.mount_ok = true;
+            self.message = Some("phone reconnected".into());
+            true
+        } else {
+            self.mount_ok = false;
+            self.message = Some("couldn't reach the phone — wake it up and press R".into());
+            false
+        }
+    }
+
+    /// Pre-flight for playback: a dead mount means mpv would silently fail
+    /// to open the FLAC (root cause of the ghost "(nothing playing)").
+    async fn ensure_mount(&mut self) -> bool {
+        if !self.mount_needs_remount() {
+            return true;
+        }
+        self.attempt_remount().await
+    }
+
     pub async fn play_selected(&mut self, p: &mut Player) {
+        if !self.ensure_mount().await {
+            return;
+        }
         if let Some(path) = self.selected().map(String::from) {
             match p.loadfile(&path, LoadMode::Replace).await {
                 Ok(resp) if resp["error"] == "success" => self.start_loading(&path),
@@ -162,6 +224,9 @@ impl App {
     }
 
     pub async fn enqueue_selected(&mut self, p: &mut Player) {
+        if !self.ensure_mount().await {
+            return;
+        }
         if let Some(path) = self.selected().map(String::from) {
             match p.loadfile(&path, LoadMode::Append).await {
                 Ok(resp) if resp["error"] == "success" => self.start_loading(&path),
@@ -178,6 +243,9 @@ impl App {
     }
 
     pub async fn enqueue_all_filtered(&mut self, p: &mut Player) {
+        if !self.ensure_mount().await {
+            return;
+        }
         let paths: Vec<String> = self
             .filtered
             .iter()
@@ -213,6 +281,9 @@ impl App {
                 self.shuffle = st.shuffle;
                 self.repeat = st.loop_playlist != "no";
                 self.status = Some(st);
+                if let Some(mp) = &self.phone_mount {
+                    self.mount_ok = crate::kde::mount_alive(mp);
+                }
                 self.sync_lyrics_follow();
             }
             Err(e) => {
@@ -385,6 +456,9 @@ impl App {
         if self.cover.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => self.cover = None,
+                KeyCode::Char('R') => {
+                    self.attempt_remount().await;
+                }
                 KeyCode::Char('n') => {
                     let _ = p.next().await;
                 }
@@ -410,6 +484,10 @@ impl App {
         // reach the player (fullscreen popup, music control must live)
         if self.lyrics.is_some() {
             match (&self.lyrics, key.code) {
+                (_, KeyCode::Char('R')) => {
+                    self.attempt_remount().await;
+                    return Action::None;
+                }
                 (_, KeyCode::Char('n')) => {
                     let _ = p.next().await;
                     return Action::None;
@@ -492,6 +570,9 @@ impl App {
                 KeyCode::Right => { let _ = p.seek(10.0).await; }
                 KeyCode::Char('s') => { let _ = p.toggle_shuffle().await; }
                 KeyCode::Char('r') => { let _ = p.toggle_repeat().await; }
+                KeyCode::Char('R') => {
+                    self.attempt_remount().await;
+                }
                 KeyCode::Char('l') => self.toggle_lyrics(p).await,
                 KeyCode::Char('i') => self.toggle_cover(p).await,
                 KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -554,6 +635,9 @@ impl App {
                 KeyCode::Char('-') => {
                     self.volume = (self.volume - 5).max(0);
                     let _ = p.set_volume(self.volume).await;
+                }
+                KeyCode::Char('R') => {
+                    self.attempt_remount().await;
                 }
                 KeyCode::Tab | KeyCode::Esc => self.view = View::Library,
                 _ => {}
@@ -1238,6 +1322,79 @@ mod tests {
             );
             assert!(app.lyrics.is_some(), "popup stays open");
         }
+    }
+
+    #[tokio::test]
+    async fn play_with_dead_mount_remounts_first() {
+        let (mut player, log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100
+        }))
+        .await;
+        let mut app = app_with(&["a.flac"]);
+        // a path that is never in /proc/mounts → mount_needs_remount = true
+        app.phone_mount = Some("/nonexistent-flactui-test".into());
+        app.mount_ok = false;
+        app.remount_ok = Some(true); // test override: remount succeeds
+        app.play_selected(&mut player).await;
+        let log = log.lock().await;
+        assert!(
+            log.iter().any(|c| c.contains("loadfile")),
+            "must load AFTER remounting: {log:?}"
+        );
+        drop(log);
+        assert_eq!(
+            app.phone_mount.as_deref(),
+            Some(std::path::Path::new("/nonexistent-flactui-test"))
+        );
+    }
+
+    #[tokio::test]
+    async fn play_with_unreachable_phone_reports_honestly() {
+        let (mut player, log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100
+        }))
+        .await;
+        let mut app = app_with(&["a.flac"]);
+        app.phone_mount = Some("/nonexistent-flactui-test".into());
+        app.mount_ok = false;
+        app.remount_ok = Some(false); // remount fails (celu unreachable)
+        app.play_selected(&mut player).await;
+        assert!(
+            !log.lock().await.iter().any(|c| c.contains("loadfile")),
+            "must NOT loadfile when the phone is unreachable"
+        );
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("couldn't reach the phone"),
+            "honest message, got {:?}",
+            app.message
+        );
+    }
+
+    #[tokio::test]
+    async fn r_key_remounts_manually() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["a.flac"]);
+        app.phone_mount = Some("/nonexistent-flactui-test".into());
+        app.mount_ok = false;
+        app.remount_ok = Some(true);
+        app.on_key(key('R'), &mut player).await;
+        assert!(app.mount_ok, "manual R restores mount_ok");
+    }
+
+    #[tokio::test]
+    async fn r_key_inside_popups_remounts() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["a.flac"]);
+        app.lyrics = Some(super::Lyrics::Plain("x".into()));
+        app.phone_mount = Some("/nonexistent-flactui-test".into());
+        app.mount_ok = false;
+        app.remount_ok = Some(true);
+        app.on_key(key('R'), &mut player).await;
+        assert!(app.mount_ok);
+        assert!(app.lyrics.is_some(), "popup stays open");
     }
 
     #[tokio::test]
