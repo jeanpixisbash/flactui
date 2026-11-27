@@ -45,7 +45,7 @@ fn grid_offset(grid: u16, area: u16) -> i32 {
 }
 
 fn draw_cover(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 60, f.area());
+    let area = f.area(); // fullscreen: hide the library/queue behind
     f.render_widget(ratatui::widgets::Clear, area);
     let (title, art) = match &app.cover {
         Some(crate::app::CoverView::Ready { art, title }) => (title.as_str(), Some(art)),
@@ -84,7 +84,7 @@ fn draw_cover(f: &mut Frame, app: &App) {
 }
 
 fn draw_lyrics(f: &mut Frame, app: &App) {
-    let area = centered_rect(70, 70, f.area());
+    let area = f.area(); // fullscreen: hide the library/queue behind
     f.render_widget(ratatui::widgets::Clear, area); // wipe what's underneath
 
     match &app.lyrics {
@@ -458,16 +458,16 @@ mod tests {
         // distinct first/last markers: "line 01" would substring-match "line 10"
         // 22 lines vs ~19 visible → max scroll 3, so scroll=2 shows the tail
         let mut lines = vec!["primera".to_string()];
-        lines.extend((2..=21).map(|i| format!("relleno {i}")));
+        lines.extend((2..=38).map(|i| format!("relleno {i}")));
         lines.push("última".to_string());
         app.lyrics = Some(crate::app::Lyrics::Plain(lines.join("\n")));
         let text = render_at(120, 30, &app);
         assert!(text.contains("primera"), "popup should render: {text}");
         assert!(text.contains("lyrics"), "title bar");
 
-        // con scroll al máximo (22 líneas, ~19 visibles → máx 3),
-        // la primera línea sale del área y se ve el final
-        app.lyrics_scroll = 3;
+        // fullscreen: inner ~28 rows vs 39 lines → max scroll = 11;
+        // al fondo se ve el final y la primera línea desaparece
+        app.lyrics_scroll = 11;
         let scrolled = render_at(120, 30, &app);
         assert!(!scrolled.contains("primera"), "scrolled past first line");
         assert!(scrolled.contains("última"));
@@ -539,13 +539,22 @@ mod tests {
 
     #[test]
     fn timed_g_shows_top() {
-        let mut app = app_timed();
+        // 40 lines vs ~28 fullscreen rows: g must anchor the list top, and the
+        // tail goes out of view
+        let mut app = app_playing();
+        let lines = (0..40)
+            .map(|i| crate::lyrics::LrcLine {
+                time: i as f64 * 10.0,
+                text: format!("line {i:02}"),
+            })
+            .collect();
+        app.lyrics = Some(crate::app::Lyrics::Timed(crate::lyrics::LrcLines { lines }));
         app.status.as_mut().unwrap().time_pos = Some(100.0); // active 10
         app.sync_lyrics_follow();
         app.lyrics_offset = -10; // center = 0 → list top at window top
         let text = render_at(120, 30, &app);
         assert!(text.contains("line 00"), "g shows the list top: {text}");
-        assert!(!text.contains("line 10"), "active scrolled out of view");
+        assert!(!text.contains("line 39"), "tail out of view when top-anchored");
     }
 
     #[test]
@@ -590,11 +599,30 @@ mod tests {
                 eprintln!("DBG ({x},16)={s:?} len={}", s.chars().count());
             }
         }
-        // expected: centered within the popup's inner area (ratatui rounds up)
-        let area = centered_rect(70, 70, ratatui::layout::Rect::new(0, 0, 120, 30));
+        // expected: centered within the popup's inner area (fullscreen,
+        // ratatui rounds up)
+        let area = ratatui::layout::Rect::new(0, 0, 120, 30);
         let inner_w = area.width - 2;
         let expected = area.x + 1 + (inner_w - 7 + 1) / 2; // 7 = len("line 10")
         assert_eq!(x_found, expected, "lyric line must be horizontally centered");
+    }
+
+    #[test]
+    fn lyrics_popup_covers_full_screen() {
+        let mut app = app_playing();
+        app.lyrics = Some(crate::app::Lyrics::Plain("hola mundo".into()));
+        let text = render_at(120, 30, &app);
+        assert!(
+            !text.contains("library ("),
+            "lyrics fullscreen must hide the library behind: {text}"
+        );
+        let mut app = app_playing();
+        app.cover = Some(crate::app::CoverView::Plain("no embedded cover".into()));
+        let text = render_at(120, 30, &app);
+        assert!(
+            !text.contains("library ("),
+            "cover fullscreen must hide the library behind: {text}"
+        );
     }
 
     #[test]
