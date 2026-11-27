@@ -103,6 +103,7 @@ fn draw_lyrics(f: &mut Frame, app: &App) {
             let off = app.lyrics_scroll.min(max_off) as u16;
 
             let para = Paragraph::new(text)
+                .alignment(ratatui::layout::Alignment::Center)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -164,7 +165,7 @@ fn draw_timed_lyrics(f: &mut Frame, app: &App, area: Rect, lines: &crate::lyrics
         };
         rows_out.push(ratatui::text::Line::from(line.text.clone()).style(style));
     }
-    let para = Paragraph::new(rows_out);
+    let para = Paragraph::new(rows_out).alignment(ratatui::layout::Alignment::Center);
     f.render_widget(para, inner);
 }
 
@@ -554,6 +555,46 @@ mod tests {
         app.sync_lyrics_follow();
         let text = render_at(120, 30, &app);
         assert!(text.contains("line 00"), "list from the top: {text}");
+    }
+
+    #[test]
+    fn timed_lines_are_horizontally_centered() {
+        let mut app = app_timed();
+        app.status.as_mut().unwrap().time_pos = Some(100.0);
+        app.sync_lyrics_follow();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // one char per cell → string index == column (take only the first char
+        // of each symbol: multi-char symbols would inflate the index)
+        let col_of = |needle: &str| -> Option<(u16, u16)> {
+            for y in 0..30u16 {
+                let row: String = (0..120u16)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect();
+                // find() is BYTE index; multi-byte chars before the match
+                // (border glyphs, accents behind the popup) shift it — map
+                // back to char index == cell column
+                if let Some(b) = row.find(needle) {
+                    return Some((row[..b].chars().count() as u16, y));
+                }
+            }
+            None
+        };
+        let (x_found, y_found) = col_of("line 10").expect("active line rendered");
+        if std::env::var("DBG_CENTER").is_ok() {
+            eprintln!("DBG x={x_found} y={y_found}");
+            for x in 55..70u16 {
+                let s = buf[(x, 16)].symbol();
+                eprintln!("DBG ({x},16)={s:?} len={}", s.chars().count());
+            }
+        }
+        // expected: centered within the popup's inner area (ratatui rounds up)
+        let area = centered_rect(70, 70, ratatui::layout::Rect::new(0, 0, 120, 30));
+        let inner_w = area.width - 2;
+        let expected = area.x + 1 + (inner_w - 7 + 1) / 2; // 7 = len("line 10")
+        assert_eq!(x_found, expected, "lyric line must be horizontally centered");
     }
 
     #[test]
