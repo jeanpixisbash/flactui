@@ -29,6 +29,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" --generate-notes
           gh release upload "${GITHUB_REF_NAME}" \
             target/x86_64-unknown-linux-musl/release/flactui#flactui-x86_64-linux-musl \
             --clobber --repo "$GITHUB_REPOSITORY"
