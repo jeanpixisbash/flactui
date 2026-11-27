@@ -42,6 +42,17 @@ pub struct Player {
     writer: tokio::net::unix::OwnedWriteHalf,
     next_id: u64,
     sock_path: PathBuf,
+    /// test-only property overrides consulted by get_property
+    #[cfg(test)]
+    test_overrides: std::collections::HashMap<String, Value>,
+}
+
+#[cfg(test)]
+impl Player {
+    /// Force a property value for subsequent get_property calls (tests).
+    pub fn set_property_for_test(&mut self, name: &str, value: Value) {
+        self.test_overrides.insert(name.to_string(), value);
+    }
 }
 
 impl Player {
@@ -89,6 +100,8 @@ impl Player {
             writer: write,
             next_id: 1,
             sock_path: sock.to_path_buf(),
+            #[cfg(test)]
+            test_overrides: Default::default(),
         })
     }
 
@@ -108,6 +121,15 @@ impl Player {
     /// mpv-level errors (e.g. missing file) come back as Ok(resp) — the caller
     /// decides what to do with `resp["error"]`.
     async fn command(&mut self, cmd: Value) -> anyhow::Result<Value> {
+        // test override: answer without touching the socket
+        #[cfg(test)]
+        if cmd.get("command").and_then(|c| c.get(0)).and_then(Value::as_str) == Some("get_property")
+        {
+            let name = cmd["command"][1].as_str().unwrap_or("");
+            if let Some(v) = self.test_overrides.get(name) {
+                return Ok(serde_json::json!({ "error": "success", "data": v }));
+            }
+        }
         let id = self.next_id;
         self.next_id += 1;
         // mpv request format: {"command": [...], "request_id": N}

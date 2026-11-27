@@ -38,6 +38,8 @@ pub struct App {
     /// lyrics popup: Some(text) = open
     pub lyrics: Option<String>,
     pub lyrics_scroll: usize,
+    /// track we asked mpv to load, until status confirms it (loading feedback)
+    pub loading: Option<String>,
 }
 
 impl App {
@@ -63,6 +65,7 @@ impl App {
             repeat: false,
             lyrics: None,
             lyrics_scroll: 0,
+            loading: None,
         }
     }
 
@@ -100,26 +103,48 @@ impl App {
             .map(String::as_str)
     }
 
+    fn track_name(path: &str) -> String {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string())
+    }
+
+    /// Set the loading feedback: mpv opens a network FLAC in seconds, and
+    /// without this the silence reads as "it doesn't play".
+    fn start_loading(&mut self, path: &str) {
+        self.loading = Some(path.to_string());
+        self.message = Some(format!("loading {}…", Self::track_name(path)));
+    }
+
     pub async fn play_selected(&mut self, p: &mut Player) {
-        if let Some(path) = self.selected() {
-            match p.loadfile(path, LoadMode::Replace).await {
-                Ok(resp) if resp["error"] == "success" => self.message = None,
+        if let Some(path) = self.selected().map(String::from) {
+            match p.loadfile(&path, LoadMode::Replace).await {
+                Ok(resp) if resp["error"] == "success" => self.start_loading(&path),
                 Ok(resp) => {
+                    self.loading = None;
                     self.message = Some(format!("error: {}", resp["error"].as_str().unwrap_or("?")))
                 }
-                Err(e) => self.message = Some(format!("player error: {e}")),
+                Err(e) => {
+                    self.loading = None;
+                    self.message = Some(format!("player error: {e}"))
+                }
             }
         }
     }
 
     pub async fn enqueue_selected(&mut self, p: &mut Player) {
-        if let Some(path) = self.selected() {
-            match p.loadfile(path, LoadMode::Append).await {
-                Ok(resp) if resp["error"] == "success" => self.message = None,
+        if let Some(path) = self.selected().map(String::from) {
+            match p.loadfile(&path, LoadMode::Append).await {
+                Ok(resp) if resp["error"] == "success" => self.start_loading(&path),
                 Ok(resp) => {
+                    self.loading = None;
                     self.message = Some(format!("error: {}", resp["error"].as_str().unwrap_or("?")))
                 }
-                Err(e) => self.message = Some(format!("player error: {e}")),
+                Err(e) => {
+                    self.loading = None;
+                    self.message = Some(format!("player error: {e}"))
+                }
             }
         }
     }
@@ -140,6 +165,11 @@ impl App {
         match p.status().await {
             Ok(st) => {
                 self.queue = st.playlist.clone();
+                // the requested file made it into mpv → loading is over
+                if self.loading.is_some() && st.path.is_some() {
+                    self.loading = None;
+                    self.message = None;
+                }
                 if let Some(v) = st.volume {
                     self.volume = v;
                 }
@@ -395,7 +425,8 @@ mod tests {
         let (mut player, log) = fake_player(serde_json::json!({})).await;
         let mut app = app_with(&["Es Épico.flac"]);
         app.play_selected(&mut player).await;
-        assert!(app.message.is_none());
+        // success now shows loading feedback (cleared once status confirms)
+        assert!(app.message.as_deref().unwrap_or("").contains("loading"));
         // loadfile request body must carry the absolute joined path
         // (the log only stores names; assert via the second raw field instead)
         assert_eq!(log.lock().await.len(), 1);
@@ -625,6 +656,33 @@ mod tests {
         let mut app = app_with(&["a.flac"]);
         app.on_key(key('l'), &mut player).await;
         assert_eq!(app.lyrics.as_deref(), Some("nothing playing"));
+    }
+
+    #[tokio::test]
+    async fn play_shows_loading_feedback_until_status_confirms() {
+        // streaming over SFTP takes seconds — without feedback it looks broken
+        let (mut player, _log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100
+        }))
+        .await;
+        let mut app = app_with(&["Es Epico.flac"]);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut player)
+            .await;
+        let msg = app.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("loading") && msg.contains("Es Epico.flac"),
+            "expected loading feedback, got: {msg:?}"
+        );
+
+        // the status poll still shows nothing loaded → keep the feedback
+        app.refresh_status(&mut player).await;
+        assert!(app.message.as_deref().unwrap_or("").contains("loading"));
+
+        // now mpv reports the file loaded → feedback clears
+        player.set_property_for_test("path", "/m/Es Epico.flac".into());
+        app.refresh_status(&mut player).await;
+        assert_eq!(app.message, None);
+        assert!(app.loading.is_none());
     }
 
     #[tokio::test]

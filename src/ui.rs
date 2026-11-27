@@ -110,11 +110,17 @@ fn draw_queue(f: &mut Frame, app: &App, area: Rect) {
             ListItem::new(format!("{marker}{t}"))
         })
         .collect();
+    // discoverability: the panel advertises its own keys when there's room
+    let title = if area.width >= 40 {
+        format!(" queue ({}) · d remove · D clear ", app.queue.len())
+    } else {
+        format!(" queue ({}) ", app.queue.len())
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" queue ({}) ", app.queue.len()))
+                .title(title)
                 .border_style(Style::default().fg(ACCENT_2)),
         )
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -292,6 +298,17 @@ mod tests {
         let scrolled = render_at(120, 30, &app);
         assert!(!scrolled.contains("primera"), "scrolled past first line");
         assert!(scrolled.contains("última"));
+    }
+
+    #[test]
+    fn queue_title_shows_remove_and_clear_keys() {
+        // discoverability: the queue panel must advertise d/D
+        let mut app = app_playing();
+        app.queue = vec!["a.flac".into(), "b.flac".into(), "c.flac".into()];
+        let text = render_at(120, 30, &app);
+        assert!(text.contains("d remove"), "queue title lacks remove hint: {text}");
+        assert!(text.contains("D clear"), "queue title lacks clear hint: {text}");
+        assert!(text.contains("queue (3"), "queue count missing: {text}");
     }
 
     #[test]
