@@ -217,7 +217,7 @@ impl App {
     /// `[mm:ss.xx]`, word timestamps `<mm:ss.xx>` (often duplicated), metadata
     /// headers (`[ti:…]`) and voice labels (`v1:`, `bg:`). Plain text — and
     /// lyrics with a stray "<3" — will lose the "<3" to this; acceptable.
-    fn clean_lyrics(raw: &str) -> String {
+    pub fn clean_lyrics(raw: &str) -> String {
         const VOICE_LABELS: [&str; 6] = ["v1", "v2", "v3", "bg", "d1", "d2"];
         let mut out = Vec::new();
         for line in raw.lines() {
