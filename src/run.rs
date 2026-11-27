@@ -19,14 +19,13 @@ impl EventPump {
     /// on their own thread; we bridge to async with an unbounded channel).
     pub fn spawn_real() -> EventPump {
         let (tx, rx) = mpsc::unbounded_channel();
-        std::thread::spawn(move || loop {
-            match crossterm::event::read() {
-                Ok(ev) => {
-                    if tx.send(ev).is_err() {
-                        break;
-                    }
+        std::thread::spawn(move || {
+            while let Some(ev) =
+                read_event_with_retry(|| crossterm::event::read().map_err(Into::into))
+            {
+                if tx.send(ev).is_err() {
+                    break;
                 }
-                Err(_) => break,
             }
         });
         EventPump { rx, _keepalive: None }
@@ -53,6 +52,31 @@ impl EventPump {
 
     pub async fn next(&mut self) -> Option<Event> {
         self.rx.recv().await
+    }
+}
+
+/// Bounded retry around ONE crossterm read: transient errors (EINTR and
+/// friends) are retried, but a persistent failure (terminal gone) gives up
+/// after `MAX_READ_ERRORS` consecutive attempts (returns None) instead of
+/// hanging or exiting the whole TUI without a trace.
+const MAX_READ_ERRORS: u32 = 5;
+
+fn read_event_with_retry<F>(mut read: F) -> Option<Event>
+where
+    F: FnMut() -> std::io::Result<Event>,
+{
+    let mut errors = 0u32;
+    loop {
+        match read() {
+            Ok(ev) => return Some(ev),
+            Err(_) => {
+                errors += 1;
+                if errors >= MAX_READ_ERRORS {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 }
 
@@ -111,5 +135,32 @@ mod tests {
             .unwrap()
             .contains("still mounted"));
         assert!(farewell_prompt(false).is_none());
+    }
+
+    #[test]
+    fn read_events_retries_transient_errors() {
+        // crossterm read errors (EINTR etc.) happen; the pump thread must
+        // retry instead of silently killing the TUI
+        let mut attempts = 0;
+        let ev = read_event_with_retry(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "eintr"))
+            } else {
+                Ok(Event::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('q'),
+                    crossterm::event::KeyModifiers::NONE,
+                )))
+            }
+        });
+        assert!(ev.is_some(), "transient errors retried until the event");
+    }
+
+    #[test]
+    fn read_events_gives_up_after_streak_of_errors() {
+        // a persistent failure (terminal gone) ends the thread after a bounded
+        // retry streak — it must not spin forever either
+        let ev = read_event_with_retry(|| Err(std::io::Error::other("terminal gone")));
+        assert!(ev.is_none());
     }
 }

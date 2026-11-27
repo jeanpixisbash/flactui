@@ -31,17 +31,40 @@ else
 fi
 
 echo
-if [ ! -x "$(dirname "$0")/flactui" ] && [ ! -x "target/release/flactui" ]; then
+# A prebuilt binary is only trusted if it is a real ELF executable for this
+# machine — a stale, corrupt or wrong-arch file must not get installed.
+looks_like_elf() {
+  [ -f "$1" ] || return 1
+  [ "$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] || return 1
+  # arch check when `file` is available (x86-64 / aarch64 naming differs)
+  if command -v file >/dev/null 2>&1 && command -v uname >/dev/null 2>&1; then
+    case "$(uname -m)" in
+      x86_64)  file -b "$1" | grep -q "x86-64" ;;
+      aarch64) file -b "$1" | grep -q "aarch64" ;;
+      *) true ;; # unknown host arch: ELF magic is all we can sanity-check
+    esac
+  else
+    true
+  fi
+}
+
+PREBUILT="$(dirname "$0")/flactui"
+BUILT="$(dirname "$0")/target/release/flactui"
+if [ -x "$PREBUILT" ] && ! looks_like_elf "$PREBUILT"; then
+  echo "⚠  '$PREBUILT' is not a valid ELF binary for this machine — ignoring it."
+  PREBUILT="/nonexistent"
+fi
+if [ ! -x "$PREBUILT" ] && [ ! -x "$BUILT" ]; then
   if ! command -v cargo >/dev/null 2>&1; then
-    echo "No prebuilt binary and no cargo. Install Rust (https://rustup.rs) or download"
+    echo "No valid prebuilt binary and no cargo. Install Rust (https://rustup.rs) or download"
     echo "a release binary from GitHub Releases and put it next to this installer."
     exit 1
   fi
   echo "Building flactui (release)..."
-  cargo build --release
-  BIN="target/release/flactui"
+  (cd "$(dirname "$0")" && cargo build --release)
+  BIN="$BUILT"
 else
-  BIN="$( [ -x "$(dirname "$0")/flactui" ] && echo "$(dirname "$0")/flactui" || echo "target/release/flactui" )"
+  BIN="$( [ -x "$PREBUILT" ] && echo "$PREBUILT" || echo "$BUILT" )"
 fi
 
 mkdir -p "$DEST"

@@ -155,10 +155,19 @@ impl App {
             .iter()
             .filter_map(|&i| self.tracks.get(i).cloned())
             .collect();
+        let mut queued = 0usize;
+        let mut failed = 0usize;
         for path in &paths {
-            let _ = p.loadfile(path, LoadMode::Append).await;
+            match p.loadfile(path, LoadMode::Append).await {
+                Ok(resp) if resp["error"] == "success" => queued += 1,
+                _ => failed += 1,
+            }
         }
-        self.message = Some(format!("queued {} tracks", paths.len()));
+        self.message = Some(if failed == 0 {
+            format!("queued {queued} tracks")
+        } else {
+            format!("queued {queued} of {}, {failed} failed", paths.len())
+        });
     }
 
     pub async fn refresh_status(&mut self, p: &mut Player) {
@@ -415,6 +424,10 @@ mod tests {
                 let cmd = req["command"].as_array().unwrap();
                 let name = cmd[0].as_str().unwrap().to_string();
                 log_srv.lock().await.push(req["command"].to_string());
+                // a loadfile whose path contains "fail" simulates an mpv-level
+                // rejection (e.g. unreadable file) for honest-enqueue tests
+                let load_failed = name == "loadfile"
+                    && cmd.get(1).and_then(|v| v.as_str()).map(|p| p.contains("fail")).unwrap_or(false);
                 let data = if name == "get_property" {
                     prop_data
                         .get(cmd[1].as_str().unwrap())
@@ -423,8 +436,11 @@ mod tests {
                 } else {
                     serde_json::Value::Null
                 };
-                let resp =
-                    serde_json::json!({ "error": "success", "request_id": id, "data": data });
+                let resp = if load_failed {
+                    serde_json::json!({ "error": "invalid parameter", "request_id": id })
+                } else {
+                    serde_json::json!({ "error": "success", "request_id": id, "data": data })
+                };
                 write.write_all(format!("{resp}\n").as_bytes()).await.unwrap();
             }
         });
@@ -749,6 +765,30 @@ mod tests {
             super::App::clean_lyrics("primera línea\n\nsegunda\n"),
             "primera línea\n\nsegunda"
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_all_reports_real_failures() {
+        // mpv may reject some files (unreadable over SFTP etc.) — the message
+        // must count what actually got queued, not the attempt count
+        let (mut player, _log) = fake_player(serde_json::json!({
+            "pause": false, "playlist": [], "playlist-pos": 0, "volume": 100
+        }))
+        .await;
+        let mut app = app_with(&[
+            "Buena.flac",
+            "fail-uno.flac",
+            "Otra Buena.flac",
+            "fail-dos.flac",
+        ]);
+        app.enqueue_all_filtered(&mut player).await;
+        let msg = app.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("queued 2") && msg.contains("4") && msg.contains("failed"),
+            "expected honest count like 'queued 2 of 4, 2 failed', got: {msg:?}"
+        );
+        // two successful appends happened
+        assert_eq!(_log.lock().await.iter().filter(|c| c.contains("loadfile")).count(), 4);
     }
 
     #[tokio::test]
