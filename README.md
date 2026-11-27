@@ -77,6 +77,10 @@ flactui --keep-mounted   # skip the unmount prompt on exit
 In the queue view: `d` removes a track, `J`/`K` move it down/up, `Enter` jumps
 to it, `D` clears the queue.
 
+Covers are cached in `~/.cache/flactui/covers/` keyed by track path — if you
+re-tag a FLAC with new art, clear the cache with
+`rm -rf ~/.cache/flactui/covers` to see the new one.
+
 ## How it works
 
 1. Finds a reachable paired phone over D-Bus (`org.kde.kdeconnect.daemon`).

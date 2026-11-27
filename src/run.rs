@@ -100,6 +100,8 @@ pub async fn run_app<B: Backend>(
         if !player.is_alive() {
             app.message = Some("player lost — press q to exit".into());
         }
+        // apply a finished background cover decode, if any
+        app.poll_cover();
         terminal
             .draw(|f| ui::draw(f, app))
             .map_err(|e| anyhow::anyhow!("draw error: {e}"))?;

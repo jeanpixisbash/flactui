@@ -27,7 +27,9 @@ pub fn flac_picture_bytes(r: &mut impl Read) -> anyhow::Result<Option<Vec<u8>>> 
         if block_type == 6 {
             let mut payload = vec![0u8; len as usize];
             r.read_exact(&mut payload)?;
-            return Ok(Some(decode_picture_block(&payload)));
+            let data = decode_picture_block(&payload)
+                .ok_or_else(|| anyhow::anyhow!("malformed PICTURE block"))?;
+            return Ok(Some(data));
         }
         let mut skip = vec![0u8; len as usize];
         r.read_exact(&mut skip)?;
@@ -163,21 +165,22 @@ pub fn track_name(path: &str) -> String {
 }
 
 /// METADATA_BLOCK_PICTURE wire format → raw image bytes (the embedded PNG/JPEG).
-fn decode_picture_block(payload: &[u8]) -> Vec<u8> {    let be32 = |off: usize| -> usize {
-        u32::from_be_bytes([
-            payload[off],
-            payload[off + 1],
-            payload[off + 2],
-            payload[off + 3],
-        ]) as usize
+/// Every field comes from an untrusted file: all reads are bounds-checked and
+/// any malformation yields `None` (the caller maps that to a decode error).
+fn decode_picture_block(payload: &[u8]) -> Option<Vec<u8>> {
+    let be32 = |off: usize| -> Option<u32> {
+        let b = payload.get(off..off + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     };
-    let mime_len = be32(4);
-    let desc_off = 8 + mime_len;
-    let desc_len = be32(desc_off);
-    // data_len_off: desc_len FIELD (4 bytes) + desc + width/height/depth/colors (16)
-    let data_len_off = desc_off + 4 + desc_len + 16;
-    let data_off = data_len_off + 4;
-    payload[data_off..data_off + be32(data_len_off)].to_vec()
+    let mime_len = be32(4)? as usize;
+    let desc_off = 8usize.checked_add(mime_len)?;
+    let desc_len = be32(desc_off)? as usize;
+    // desc_len FIELD (4 bytes) + desc + width/height/depth/colors (16)
+    let data_len_off = desc_off.checked_add(4)?.checked_add(desc_len)?.checked_add(16)?;
+    let data_len = be32(data_len_off)? as usize;
+    let data_off = data_len_off.checked_add(4)?;
+    let end = data_off.checked_add(data_len)?;
+    payload.get(data_off..end).map(<[u8]>::to_vec)
 }
 
 #[cfg(test)]
@@ -226,9 +229,6 @@ mod tests {
         let fixture = flac_fixture(Some(data), 1000);
         let got = flac_picture_bytes(&mut fixture.as_slice()).unwrap();
         assert_eq!(got.as_deref(), Some(data.as_slice()));
-        // only the metadata prefix was consumed, not the trailing audio:
-        // (1000 trailing bytes were never needed — nothing else to assert here)
-        assert_eq!(fixture.len(), flac_fixture(Some(data), 1000).len());
     }
 
     #[test]
@@ -247,6 +247,43 @@ mod tests {
         let off = 4 + 4 + 34 + 1; // magic + STREAMINFO header + body + PICTURE flag byte
         v[off..off + 3].copy_from_slice(&be24(plen));
         assert!(flac_picture_bytes(&mut v.as_slice()).is_err());
+    }
+
+    #[test]
+    fn flac_picture_malformed_payload_errors_not_panics() {
+        // hostile PICTURE payload fields (attacker = a corrupted file on the
+        // phone): huge mime_len / desc_len / data_len must yield Err, never a
+        // panic — the TUI must survive any file the FUSE mount serves
+        let build = |mime_len: u32, desc_len: u32, data_len: u32| -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&be32(3));
+            payload.extend_from_slice(&be32(mime_len));
+            payload.extend_from_slice(b"image/png");
+            payload.extend_from_slice(&be32(desc_len));
+            for w in [0u32; 4] {
+                payload.extend_from_slice(&be32(w));
+            }
+            payload.extend_from_slice(&be32(data_len));
+            payload.extend_from_slice(b"\x89PNG-data");
+            let mut v = Vec::new();
+            v.extend_from_slice(b"fLaC");
+            v.push(0x00);
+            v.extend_from_slice(&be24(34));
+            v.extend_from_slice(&[0u8; 34]);
+            v.push(0x80 | 6);
+            v.extend_from_slice(&be24(payload.len()));
+            v.extend_from_slice(&payload);
+            v
+        };
+        for (mime, desc, dlen) in [
+            (0xFFFF_FFFF, 0, 0),
+            (9, 0xFFFF_FFFF, 0),
+            (9, 0, 0xFFFF_FFFF),
+        ] {
+            let v = build(mime, desc, dlen);
+            let r = flac_picture_bytes(&mut v.as_slice());
+            assert!(r.is_err(), "malformed payload ({mime},{desc},{dlen}) must Err");
+        }
     }
 
     #[test]

@@ -33,6 +33,7 @@ truecolor — works in alacritty (no sixel/kitty protocol needed).
 ## Render rule (ratatui)
 For each cell: `Style::new().fg(top_rgb).bg(bottom_rgb)`, symbol `▀`.
 Popup area smaller than 4×4 → skip drawing (avoid division by zero).
+Superseded by the amended rule above (fixed grid, letterboxed).
 
 ## Failure modes
 - Tag without picture → `no embedded cover` text in popup.
@@ -46,6 +47,11 @@ Popup area smaller than 4×4 → skip drawing (avoid division by zero).
 - No cropping/scaling options; fit is always "fill popup, center-crop".
 - No fetching covers from the internet — embedded tags only (same policy as
   lyrics).
+
+## Render rule (ratatui) — amended after review
+The grid is FIXED at 48×24 cells (48×48 px). The popup centers it: on large
+terminals it is letterboxed (not "filled"), on small ones it is
+center-cropped. No re-resize on terminal resize (cache-friendly).
 
 ## Testing (TDD)
 - `covers.rs` unit tests: extract from a tiny generated FLAC/PNG fixture;

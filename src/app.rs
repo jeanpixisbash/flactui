@@ -13,6 +13,7 @@ pub enum View {
 }
 
 /// What the cover popup shows: the decoded art or a plain message.
+#[derive(Debug)]
 pub enum CoverView {
     Ready {
         art: crate::covers::HalfBlocks,
@@ -51,6 +52,8 @@ pub struct App {
     pub loading: Option<String>,
     /// cover popup: Some(view) = open
     pub cover: Option<CoverView>,
+    /// in-flight cover decode job (background; polled by the event loop)
+    pub cover_rx: Option<tokio::sync::oneshot::Receiver<(String, Result<crate::covers::HalfBlocks, crate::covers::CoverError>)>>,
 }
 
 impl App {
@@ -78,6 +81,7 @@ impl App {
             lyrics_scroll: 0,
             loading: None,
             cover: None,
+            cover_rx: None,
         }
     }
 
@@ -274,11 +278,13 @@ impl App {
         }
     }
 
-    /// Toggle the cover popup: extracts the embedded album art of the
-    /// playing (or selected) track. Decode work runs off the UI thread.
+    /// Toggle the cover popup: opens it instantly with loading feedback while
+    /// the embedded art decodes in the background (the event loop keeps
+    /// repainting; `poll_cover` applies the result when it lands).
     pub async fn toggle_cover(&mut self, p: &mut Player) {
         if self.cover.is_some() {
             self.cover = None;
+            self.cover_rx = None; // orphan the in-flight job; result discarded
             return;
         }
         let path = self
@@ -291,22 +297,47 @@ impl App {
             return;
         };
         let title = crate::covers::track_name(&path);
-        let res = tokio::task::spawn_blocking(move || {
+        self.cover = Some(CoverView::Plain("loading cover…".into()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
             // v1: FLAC covers only — other formats read as "no embedded cover"
-            if !path.to_lowercase().ends_with(".flac") {
-                return Err(crate::covers::CoverError::NoPicture);
-            }
-            crate::covers::load(&path)
-        })
-        .await;
-        self.cover = Some(match res {
-            Ok(Ok(art)) => CoverView::Ready { art, title },
-            Ok(Err(crate::covers::CoverError::NoPicture)) => {
-                CoverView::Plain("no embedded cover".into())
-            }
-            Ok(Err(e)) => CoverView::Plain(e.to_string()),
-            Err(e) => CoverView::Plain(format!("cover unavailable: {e}")),
+            let res = if !path.to_lowercase().ends_with(".flac") {
+                Err(crate::covers::CoverError::NoPicture)
+            } else {
+                crate::covers::load(&path)
+            };
+            let _ = tx.send((title, res));
         });
+        self.cover_rx = Some(rx);
+    }
+
+    /// Apply a finished background cover job, if one landed.
+    pub fn poll_cover(&mut self) {
+        let Some(mut rx) = self.cover_rx.take() else { return };
+        match rx.try_recv() {
+            Ok((title, res)) => {
+                self.cover = Some(match res {
+                    Ok(art) => CoverView::Ready { art, title },
+                    Err(crate::covers::CoverError::NoPicture) => {
+                        CoverView::Plain("no embedded cover".into())
+                    }
+                    Err(e) => {
+                        // also surface it in the playbar: long reasons get
+                        // truncated in the popup's border title
+                        self.message = Some(e.to_string());
+                        CoverView::Plain(e.to_string())
+                    }
+                });
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                // still decoding — put the job back
+                self.cover_rx = Some(rx);
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                // the job died without sending (panic in the worker)
+                self.cover = Some(CoverView::Plain("cover unavailable".into()));
+            }
+        }
     }
 
     pub async fn on_key(&mut self, key: KeyEvent, p: &mut Player) -> Action {
@@ -865,6 +896,7 @@ mod tests {
         let (mut player, _log) = fake_player(serde_json::json!({})).await;
         let mut app = app_with(&["missing.flac"]);
         app.toggle_cover(&mut player).await;
+        poll_until_cover_settles(&mut app).await;
         assert!(matches!(
             app.cover,
             Some(super::CoverView::Plain(ref m)) if m.contains("cover unavailable")
@@ -896,6 +928,14 @@ mod tests {
         )
         .await;
         assert!(app.cover.is_none());
+        // 'i' and 'q' also close (q inside the popup is NOT quit)
+        app.toggle_cover(&mut player).await;
+        app.on_key(key('i'), &mut player).await;
+        assert!(app.cover.is_none());
+        app.toggle_cover(&mut player).await;
+        let action = app.on_key(key('q'), &mut player).await;
+        assert!(app.cover.is_none());
+        assert_eq!(action, super::Action::None, "q in the popup must not quit");
     }
 
     #[tokio::test]
@@ -903,10 +943,69 @@ mod tests {
         let (mut player, _log) = fake_player(serde_json::json!({})).await;
         let mut app = app_with(&["song.m4a"]);
         app.toggle_cover(&mut player).await;
+        poll_until_cover_settles(&mut app).await;
         assert!(matches!(
             app.cover,
             Some(super::CoverView::Plain(ref m)) if m.contains("no embedded cover")
         ));
+    }
+
+    /// Poll the background cover job until it lands (bounded wait).
+    async fn poll_until_cover_settles(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.cover_rx.is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            app.poll_cover();
+        }
+    }
+
+    #[tokio::test]
+    async fn cover_toggle_shows_loading_immediately() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["missing.flac"]);
+        app.toggle_cover(&mut player).await;
+        // the popup is open SYNCHRONOUSLY with loading feedback; the decode
+        // job runs in the background and the event loop keeps repainting
+        assert!(
+            matches!(
+                app.cover,
+                Some(super::CoverView::Plain(ref m)) if m.contains("loading cover")
+            ),
+            "expected loading feedback, got {:?}",
+            app.cover
+        );
+    }
+
+    #[tokio::test]
+    async fn cover_poll_applies_finished_result() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["missing.flac"]);
+        app.toggle_cover(&mut player).await;
+        // the background job finishes fast (missing file); poll until applied
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.cover_rx.is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            app.poll_cover();
+        }
+        assert!(matches!(
+            app.cover,
+            Some(super::CoverView::Plain(ref m)) if m.contains("cover unavailable")
+        ));
+        assert!(app.cover_rx.is_none());
+    }
+
+    #[tokio::test]
+    async fn cover_toggle_while_loading_cancels() {
+        let (mut player, _log) = fake_player(serde_json::json!({})).await;
+        let mut app = app_with(&["missing.flac"]);
+        app.toggle_cover(&mut player).await; // starts job
+        app.toggle_cover(&mut player).await; // closes popup, orphans job
+        assert!(app.cover.is_none());
+        assert!(app.cover_rx.is_none());
+        // the orphaned job must NOT resurrect the popup
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        app.poll_cover();
+        assert!(app.cover.is_none());
     }
 
     #[tokio::test]
